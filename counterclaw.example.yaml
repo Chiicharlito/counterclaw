@@ -1,0 +1,308 @@
+# =============================================================================
+# CounterClaw Configuration
+# =============================================================================
+
+# Général
+general:
+  # Mode de fonctionnement
+  # - "enforce" : bloque activement les actions interdites
+  # - "monitor" : log seulement, ne bloque rien (mode apprentissage)
+  # - "paranoid" : bloque tout ce qui n'est pas explicitement autorisé
+  mode: monitor
+
+  # PID file pour le daemon
+  pid_file: ~/.counterclaw/counterclaw.pid
+
+  # Log level : trace, debug, info, warn, error
+  log_level: info
+
+  # Fichier de log
+  log_file: ~/.counterclaw/logs/counterclaw.log
+
+  # Rotation des logs (en MB)
+  log_max_size_mb: 50
+
+# -----------------------------------------------------------------------------
+# Module 1 : Filesystem Guard
+# -----------------------------------------------------------------------------
+fs_guard:
+  enabled: true
+
+  # Processus à surveiller (noms ou patterns)
+  watch_processes:
+    - "openclaw"
+    - "node.*openclaw"
+    - "openclaw-gateway"
+
+  # Dossiers/fichiers INTERDITS (aucun accès, même en lecture)
+  blocked_paths:
+    - "~/.ssh"
+    - "~/.aws"
+    - "~/.gnupg"
+    - "~/.config/git/credentials"
+    - "~/Library/Keychains"
+    - "~/.env"
+    - "~/.env.*"
+    - "~/.zshrc"
+    - "~/.bashrc"
+    - "~/.zprofile"
+    - "~/.netrc"
+    - "~/.docker/config.json"
+    - "~/Library/Application Support/Google/Chrome/Default"
+    - "~/Library/Cookies"
+    - "~/Library/Safari"
+
+  # Dossiers en lecture seule (lecture OK, écriture bloquée)
+  read_only_paths:
+    - "~/Documents"
+    - "~/Downloads"
+    - "~/Projects"
+
+  # Dossiers autorisés (lecture + écriture)
+  allowed_paths:
+    - "~/.openclaw/workspace"
+    - "~/.openclaw/sandboxes"
+    - "/tmp/counterclaw-*"
+
+  # Action quand un accès bloqué est détecté
+  on_violation:
+    action: kill_and_alert
+    kill_target: process
+
+# -----------------------------------------------------------------------------
+# Module 2 : CDP Proxy (Browser Guard)
+# -----------------------------------------------------------------------------
+cdp_proxy:
+  enabled: true
+
+  # Port sur lequel CounterClaw écoute (OpenClaw se connecte ici)
+  listen_port: 18792
+
+  # Port réel de Chrome (CDP)
+  upstream_port: 18800
+
+  # Bind address (toujours loopback pour la sécurité)
+  bind_address: "127.0.0.1"
+
+  # --- Filtrage par domaine ---
+  domains:
+    blocked:
+      - "mail.google.com"
+      - "gmail.com"
+      - "drive.google.com"
+      - "docs.google.com"
+      - "web.whatsapp.com"
+      - "messenger.com"
+      - "slack.com"
+      - "app.slack.com"
+      - "discord.com"
+      - "*.banking.*"
+      - "*.bank.*"
+      - "paypal.com"
+      - "venmo.com"
+
+    allowed:
+      - "github.com"
+      - "stackoverflow.com"
+      - "*.npmjs.com"
+      - "crates.io"
+      - "docs.rs"
+      - "developer.mozilla.org"
+      - "*.wikipedia.org"
+
+    require_approval:
+      - "amazon.com"
+      - "*.google.com"
+
+    default_policy: allow
+
+  # --- Filtrage par commande CDP ---
+  cdp_commands:
+    blocked:
+      - "Network.getCookies"
+      - "Network.setCookie"
+      - "Network.deleteCookies"
+      - "Storage.getCookies"
+      - "Storage.setLocalStorageItem"
+      - "Storage.clearDataForOrigin"
+      - "Browser.getHistoryItems"
+      - "SystemInfo.getProcessInfo"
+
+    restricted_to_allowed_domains:
+      - "Input.dispatchKeyEvent"
+      - "Input.dispatchMouseEvent"
+      - "Runtime.evaluate"
+      - "Runtime.callFunctionOn"
+      - "DOM.setFileInputFiles"
+      - "Page.printToPDF"
+
+    log_always:
+      - "Page.navigate"
+      - "Page.captureScreenshot"
+      - "Network.enable"
+      - "Fetch.enable"
+
+  # --- Détection d'exfiltration dans le contenu ---
+  content_inspection:
+    enabled: true
+    patterns:
+      - name: "api_key_leak"
+        regex: '(?i)(api[_-]?key|api[_-]?secret|bearer\s+[a-z0-9])'
+        severity: critical
+        action: block
+
+      - name: "base64_large_payload"
+        regex: '[A-Za-z0-9+/]{200,}={0,2}'
+        severity: warning
+        action: alert
+
+      - name: "ssh_private_key"
+        regex: '-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----'
+        severity: critical
+        action: block
+
+      - name: "password_pattern"
+        regex: '(?i)(password|passwd|pwd)\s*[:=]\s*\S+'
+        severity: high
+        action: block
+
+# -----------------------------------------------------------------------------
+# Module 3 : Network Egress Monitor
+# -----------------------------------------------------------------------------
+net_guard:
+  enabled: true
+
+  watch_processes:
+    - "openclaw"
+    - "node.*openclaw"
+    - "openclaw-gateway"
+
+  allowed_egress:
+    - "api.anthropic.com"
+    - "api.openai.com"
+    - "generativelanguage.googleapis.com"
+    - "api.mistral.ai"
+    - "api.telegram.org"
+    - "discord.com"
+    - "gateway.discord.gg"
+    - "github.com"
+    - "api.github.com"
+    - "registry.npmjs.org"
+    - "crates.io"
+
+  max_post_payload_bytes: 51200
+  block_unknown_post: true
+  alert_on_unknown_dns: true
+  enforcement_method: log_only
+
+# -----------------------------------------------------------------------------
+# Module 4 : Command Interceptor
+# -----------------------------------------------------------------------------
+cmd_guard:
+  enabled: true
+
+  blacklist:
+    - pattern: 'rm\s+-rf\s+/'
+      description: "Suppression récursive depuis la racine"
+      severity: critical
+
+    - pattern: 'chmod\s+777'
+      description: "Permissions trop ouvertes"
+      severity: high
+
+    - pattern: 'curl\s+.*-d\s+'
+      description: "POST de données via curl"
+      severity: high
+
+    - pattern: 'wget\s+.*-O\s*-\s*\|'
+      description: "Download + pipe (exécution distante)"
+      severity: critical
+
+    - pattern: 'curl\s+.*\|\s*(ba)?sh'
+      description: "Download + exécution shell"
+      severity: critical
+
+    - pattern: 'scp\s+'
+      description: "Copie vers serveur distant"
+      severity: high
+
+    - pattern: 'rsync\s+.*@.*:'
+      description: "Sync vers serveur distant"
+      severity: high
+
+    - pattern: 'base64.*\|\s*curl'
+      description: "Encodage + exfiltration"
+      severity: critical
+
+    - pattern: 'nc\s+-'
+      description: "Netcat (reverse shell potentiel)"
+      severity: critical
+
+    - pattern: 'launchctl\s+'
+      description: "Modification des daemons système"
+      severity: critical
+
+    - pattern: 'osascript\s+-e'
+      description: "Exécution AppleScript"
+      severity: high
+
+    - pattern: 'open\s+-a\s+Terminal'
+      description: "Ouverture de terminal (escalade)"
+      severity: high
+
+    - pattern: 'security\s+find-generic-password'
+      description: "Lecture du Keychain macOS"
+      severity: critical
+
+    - pattern: 'defaults\s+read'
+      description: "Lecture des préférences système"
+      severity: warning
+
+  require_approval:
+    - pattern: 'pip\s+install'
+      description: "Installation de paquet Python"
+
+    - pattern: 'npm\s+install\s+-g'
+      description: "Installation globale npm"
+
+    - pattern: 'brew\s+install'
+      description: "Installation Homebrew"
+
+    - pattern: 'cargo\s+install'
+      description: "Installation binaire Rust"
+
+  monitoring_method: log_only
+
+# -----------------------------------------------------------------------------
+# Alerting
+# -----------------------------------------------------------------------------
+alerting:
+  macos_notification:
+    enabled: true
+
+  slack:
+    enabled: false
+    webhook_url: "https://hooks.slack.com/services/XXXX/YYYY/ZZZZ"
+    channel: "#counterclaw-alerts"
+    min_severity: warning
+
+  file_log:
+    enabled: true
+    path: "~/.counterclaw/logs/events.jsonl"
+    max_size_mb: 100
+    keep_files: 10
+
+  kill_switch:
+    enabled: true
+    threshold_severity: warning
+    threshold_count: 3
+    threshold_window_seconds: 60
+    action: suspend_openclaw
+
+# -----------------------------------------------------------------------------
+# Dashboard
+# -----------------------------------------------------------------------------
+dashboard:
+  enabled: true
+  bind_address: "127.0.0.1"
+  port: 9999
