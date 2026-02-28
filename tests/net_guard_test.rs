@@ -10,7 +10,15 @@ mod common;
 
 use counterclaw::config::NetGuardConfig;
 use counterclaw::guards::net_guard::{ConnectionParser, EgressMatcher, EgressVerdict, NetGuard};
-use counterclaw::types::Guard;
+use counterclaw::types::{Guard, OperationMode};
+
+/// Mode par défaut pour les tests existants.
+/// En Monitor, le EgressMatcher est permissif pour les destinations non dans la liste.
+/// Note: les tests existants testaient le comportement default:deny, ils doivent
+/// être mis à jour pour utiliser Paranoid pour les tests de blocage.
+fn default_mode() -> OperationMode {
+    OperationMode::Paranoid
+}
 
 // ---------------------------------------------------------------------------
 // Helper : config builder
@@ -65,21 +73,30 @@ fn creates_egress_matcher_from_allowed_list() {
 fn allows_anthropic_api() {
     let config = config_with_standard_allowed();
     let matcher = EgressMatcher::new(&config.allowed_egress);
-    assert_eq!(matcher.check("api.anthropic.com"), EgressVerdict::Allowed);
+    assert_eq!(
+        matcher.check("api.anthropic.com", &default_mode()),
+        EgressVerdict::Allowed
+    );
 }
 
 #[test]
 fn allows_github() {
     let config = config_with_standard_allowed();
     let matcher = EgressMatcher::new(&config.allowed_egress);
-    assert_eq!(matcher.check("github.com"), EgressVerdict::Allowed);
+    assert_eq!(
+        matcher.check("github.com", &default_mode()),
+        EgressVerdict::Allowed
+    );
 }
 
 #[test]
 fn allows_npm_registry() {
     let config = config_with_standard_allowed();
     let matcher = EgressMatcher::new(&config.allowed_egress);
-    assert_eq!(matcher.check("registry.npmjs.org"), EgressVerdict::Allowed);
+    assert_eq!(
+        matcher.check("registry.npmjs.org", &default_mode()),
+        EgressVerdict::Allowed
+    );
 }
 
 // ===========================================================================
@@ -90,14 +107,20 @@ fn allows_npm_registry() {
 fn blocks_unknown_domain() {
     let config = config_with_standard_allowed();
     let matcher = EgressMatcher::new(&config.allowed_egress);
-    assert_eq!(matcher.check("evil-exfil.com"), EgressVerdict::Blocked);
+    assert_eq!(
+        matcher.check("evil-exfil.com", &default_mode()),
+        EgressVerdict::Blocked
+    );
 }
 
 #[test]
 fn blocks_random_ip() {
     let config = config_with_standard_allowed();
     let matcher = EgressMatcher::new(&config.allowed_egress);
-    assert_eq!(matcher.check("185.234.12.1"), EgressVerdict::Blocked);
+    assert_eq!(
+        matcher.check("185.234.12.1", &default_mode()),
+        EgressVerdict::Blocked
+    );
 }
 
 // ===========================================================================
@@ -108,15 +131,21 @@ fn blocks_random_ip() {
 fn case_insensitive_matching() {
     let config = config_with_standard_allowed();
     let matcher = EgressMatcher::new(&config.allowed_egress);
-    assert_eq!(matcher.check("API.Anthropic.COM"), EgressVerdict::Allowed);
-    assert_eq!(matcher.check("GitHub.COM"), EgressVerdict::Allowed);
+    assert_eq!(
+        matcher.check("API.Anthropic.COM", &default_mode()),
+        EgressVerdict::Allowed
+    );
+    assert_eq!(
+        matcher.check("GitHub.COM", &default_mode()),
+        EgressVerdict::Allowed
+    );
 }
 
 #[test]
 fn handles_empty_domain() {
     let config = config_with_standard_allowed();
     let matcher = EgressMatcher::new(&config.allowed_egress);
-    assert_eq!(matcher.check(""), EgressVerdict::Blocked);
+    assert_eq!(matcher.check("", &default_mode()), EgressVerdict::Blocked);
 }
 
 #[test]
@@ -124,8 +153,14 @@ fn handles_empty_allowed_list() {
     let config = config_empty_allowed();
     let matcher = EgressMatcher::new(&config.allowed_egress);
     // Tout est bloqué quand la liste est vide
-    assert_eq!(matcher.check("github.com"), EgressVerdict::Blocked);
-    assert_eq!(matcher.check("any.domain"), EgressVerdict::Blocked);
+    assert_eq!(
+        matcher.check("github.com", &default_mode()),
+        EgressVerdict::Blocked
+    );
+    assert_eq!(
+        matcher.check("any.domain", &default_mode()),
+        EgressVerdict::Blocked
+    );
 }
 
 #[test]
@@ -134,7 +169,7 @@ fn subdomain_not_auto_allowed() {
     let matcher = EgressMatcher::new(&config.allowed_egress);
     // "api.anthropic.com" est autorisé, mais "evil.api.anthropic.com" ne l'est PAS
     assert_eq!(
-        matcher.check("evil.api.anthropic.com"),
+        matcher.check("evil.api.anthropic.com", &default_mode()),
         EgressVerdict::Blocked
     );
 }
@@ -144,7 +179,10 @@ fn blocks_domain_with_trailing_dot() {
     let config = config_with_standard_allowed();
     let matcher = EgressMatcher::new(&config.allowed_egress);
     // "api.anthropic.com." (trailing dot DNS) doit quand même être reconnu
-    assert_eq!(matcher.check("api.anthropic.com."), EgressVerdict::Allowed);
+    assert_eq!(
+        matcher.check("api.anthropic.com.", &default_mode()),
+        EgressVerdict::Allowed
+    );
 }
 
 // ===========================================================================

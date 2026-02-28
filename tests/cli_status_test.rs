@@ -66,9 +66,12 @@ fn status_stale_pid_exits_1() {
 #[test]
 fn status_unreachable_dashboard() {
     // PID file exists with current process PID (simulates running daemon)
-    // but dashboard is not listening
+    // but dashboard is not listening on the configured port.
+    // Use a free port to avoid colliding with a real running daemon.
     let env = common::TestEnv::new();
-    let yaml = common::minimal_monitor_config(&env);
+    let free_port = common::find_free_port();
+    let yaml =
+        common::minimal_monitor_config(&env).replace("port: 9999", &format!("port: {}", free_port));
     env.write_config(&yaml);
 
     // Write our own PID (we know it exists)

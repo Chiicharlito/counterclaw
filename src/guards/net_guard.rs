@@ -47,7 +47,10 @@ impl EgressMatcher {
     }
 
     /// Vérifie si une destination (domaine ou IP) est autorisée.
-    pub fn check(&self, destination: &str) -> EgressVerdict {
+    ///
+    /// En mode Monitor/Enforce, un domaine non dans la liste est autorisé (log only).
+    /// En mode Paranoid, un domaine non dans la liste est bloqué (default:deny).
+    pub fn check(&self, destination: &str, mode: &crate::types::OperationMode) -> EgressVerdict {
         if destination.is_empty() {
             return EgressVerdict::Blocked;
         }
@@ -56,17 +59,20 @@ impl EgressMatcher {
         let normalized = destination.to_lowercase();
         let normalized = normalized.strip_suffix('.').unwrap_or(&normalized);
 
-        if self.allowed.is_empty() {
-            return EgressVerdict::Blocked;
-        }
-
+        // Vérifier dans la liste autorisée
         for allowed in &self.allowed {
             if normalized == allowed.as_str() {
                 return EgressVerdict::Allowed;
             }
         }
 
-        EgressVerdict::Blocked
+        // Destination non dans la liste
+        // En Paranoid → default:deny, sinon → permissif
+        if *mode == crate::types::OperationMode::Paranoid {
+            EgressVerdict::Blocked
+        } else {
+            EgressVerdict::Allowed
+        }
     }
 }
 

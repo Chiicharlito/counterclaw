@@ -19,6 +19,15 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 // ---------------------------------------------------------------------------
+// Domaines système toujours autorisés (même en mode Paranoid)
+// ---------------------------------------------------------------------------
+
+/// Domaines système qui sont TOUJOURS autorisés, quel que soit le mode
+/// ou la configuration. Empêche de casser le fonctionnement de base
+/// (loopback, localhost).
+pub const SYSTEM_ALLOWED_DOMAINS: &[&str] = &["localhost", "127.0.0.1", "::1"];
+
+// ---------------------------------------------------------------------------
 // DomainVerdict — résultat du matching de domaine
 // ---------------------------------------------------------------------------
 
@@ -62,8 +71,16 @@ impl DomainMatcher {
     }
 
     /// Vérifie un domaine et retourne le verdict.
-    pub fn check(&self, domain: &str) -> DomainVerdict {
+    ///
+    /// En mode Paranoid, un domaine non-matché est traité comme Blocked (default:deny),
+    /// indépendamment de la default_policy configurée.
+    pub fn check(&self, domain: &str, mode: &crate::types::OperationMode) -> DomainVerdict {
         let domain_lower = domain.to_lowercase();
+
+        // Les domaines système sont TOUJOURS autorisés (bypass toute la logique)
+        if SYSTEM_ALLOWED_DOMAINS.iter().any(|&sd| sd == domain_lower) {
+            return DomainVerdict::Allowed;
+        }
 
         // Priorité : blocked > require_approval > allowed > default
         if self.matches_list(&domain_lower, &self.blocked) {
@@ -76,7 +93,12 @@ impl DomainMatcher {
             return DomainVerdict::Allowed;
         }
 
-        // Default policy
+        // Default:deny en mode Paranoid — tout ce qui n'est pas explicitement autorisé est bloqué
+        if *mode == crate::types::OperationMode::Paranoid {
+            return DomainVerdict::Blocked;
+        }
+
+        // Default policy (pour Monitor et Enforce)
         match self.default_policy.as_str() {
             "block" => DomainVerdict::Blocked,
             _ => DomainVerdict::Allowed,
@@ -415,6 +437,7 @@ pub fn process_cdp_message(
     command_filter: &CommandFilter,
     content_inspector: &ContentInspector,
     session: &mut CdpSessionState,
+    mode: &crate::types::OperationMode,
 ) -> CdpDecision {
     // Tenter de parser le message
     let msg = match parse_cdp_message(raw) {
@@ -446,7 +469,7 @@ pub fn process_cdp_message(
     if method == "Page.navigate" {
         if let Some(url) = msg.extract_navigate_url() {
             if let Some(domain) = extract_domain_from_url(&url) {
-                let verdict = domain_matcher.check(&domain);
+                let verdict = domain_matcher.check(&domain, mode);
                 match verdict {
                     DomainVerdict::Blocked => {
                         return CdpDecision::Block {
@@ -474,7 +497,7 @@ pub fn process_cdp_message(
     if command_filter.is_restricted(&method) {
         let domain_verdict = session
             .current_domain()
-            .map(|d| domain_matcher.check(&d))
+            .map(|d| domain_matcher.check(&d, mode))
             .unwrap_or(DomainVerdict::Blocked); // Pas de domaine = traité comme bloqué
 
         if !command_filter.is_allowed_on_domain(&method, &domain_verdict) {
@@ -555,6 +578,7 @@ impl CdpProxy {
         &self,
         raw: &str,
         alert_tx: &mpsc::Sender<SecurityEvent>,
+        mode: &crate::types::OperationMode,
     ) -> CdpDecision {
         let mut session = self.session.lock().expect("session lock poisoned");
         let decision = process_cdp_message(
@@ -563,6 +587,7 @@ impl CdpProxy {
             &self.command_filter,
             &self.content_inspector,
             &mut session,
+            mode,
         );
 
         self.events_total.fetch_add(1, Ordering::SeqCst);

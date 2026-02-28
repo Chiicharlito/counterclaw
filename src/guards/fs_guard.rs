@@ -97,7 +97,9 @@ impl PathMatcher {
 
     /// Vérifie un chemin contre toutes les règles.
     /// Retourne le verdict avec la priorité : Blocked > ReadOnly > Allowed > Unmatched.
-    pub fn check(&self, path: &Path) -> PathVerdict {
+    ///
+    /// En mode Paranoid, un chemin Unmatched est traité comme Blocked (default:deny).
+    pub fn check(&self, path: &Path, mode: &crate::types::OperationMode) -> PathVerdict {
         // Chemin vide → Unmatched
         if path.as_os_str().is_empty() {
             return PathVerdict::Unmatched;
@@ -115,6 +117,11 @@ impl PathMatcher {
         }
         if self.matches_list(&normalized, &self.allowed, &self.allowed_globs) {
             return PathVerdict::Allowed;
+        }
+
+        // Default:deny en mode Paranoid — tout ce qui n'est pas explicitement autorisé est bloqué
+        if *mode == crate::types::OperationMode::Paranoid {
+            return PathVerdict::Blocked;
         }
 
         PathVerdict::Unmatched
