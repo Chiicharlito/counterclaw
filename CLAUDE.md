@@ -78,8 +78,8 @@ src/
 │   ├── mod.rs
 │   ├── fs_guard.rs      # Filesystem Guard                          ✅ Phase 2
 │   ├── cdp_proxy.rs     # CDP Proxy (browser guard)                 ✅ Phase 2
-│   ├── net_guard.rs     # Network Egress Monitor                    ⏳ Phase 3
-│   └── cmd_guard.rs     # Command Interceptor                       ⏳ Phase 3
+│   ├── net_guard.rs     # Network Egress Monitor                    ✅ Phase 3
+│   └── cmd_guard.rs     # Command Interceptor                       ✅ Phase 3
 ├── alerting/
 │   ├── mod.rs
 │   ├── engine.rs        # Central alert dispatcher                  ✅ Phase 1
@@ -96,6 +96,8 @@ tests/
 ├── process_test.rs      # 9 tests — process detection
 ├── fs_guard_test.rs     # 23 tests — filesystem guard
 ├── cdp_proxy_test.rs    # 53 tests — CDP proxy
+├── cmd_guard_test.rs    # 28 tests — command guard
+├── net_guard_test.rs    # 21 tests — network guard
 └── integration_test.rs  # ⏳ Phase 4
 ```
 

@@ -7,4 +7,6 @@
 //! - cmd_guard : commandes shell exécutées
 
 pub mod cdp_proxy;
+pub mod cmd_guard;
 pub mod fs_guard;
+pub mod net_guard;
