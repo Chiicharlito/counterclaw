@@ -3,7 +3,12 @@ name = "counterclaw"
 version = "0.1.0"
 edition = "2021"
 description = "OS-level daemon protecting machines from autonomous AI agent data exfiltration"
-license = "MIT"
+license = "Apache-2.0"
+repository = "https://github.com/Chiicharlito/counterclaw"
+homepage = "https://github.com/Chiicharlito/counterclaw"
+readme = "README.md"
+keywords = ["security", "ai-agent", "daemon", "cdp-proxy", "monitoring"]
+categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 # Async runtime

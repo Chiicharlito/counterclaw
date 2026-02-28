@@ -4,7 +4,7 @@ mod common;
 
 use counterclaw::config::AppConfig;
 use counterclaw::daemon::{read_pid_file, remove_pid_file, write_pid_file, Daemon, DaemonState};
-use counterclaw::types::{EventBuffer, GuardModule, Severity};
+use counterclaw::types::{EventBuffer, GuardModule};
 use std::fs;
 use std::sync::{Arc, RwLock};
 

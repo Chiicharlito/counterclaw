@@ -1,1 +1,5 @@
 /target
+dist/
+*.pid
+*.swp
+.DS_Store
