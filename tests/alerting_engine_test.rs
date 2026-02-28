@@ -10,13 +10,10 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 
 /// Helper: crée un AlertingEngine avec un EventBuffer partagé et un TestEnv.
-fn setup_engine(
-    env: &common::TestEnv,
-) -> (AlertingEngine, Arc<RwLock<EventBuffer>>) {
+fn setup_engine(env: &common::TestEnv) -> (AlertingEngine, Arc<RwLock<EventBuffer>>) {
     let yaml = common::minimal_monitor_config(env);
     env.write_config(&yaml);
-    let config =
-        counterclaw::config::AppConfig::load(&env.config_path()).expect("valid config");
+    let config = counterclaw::config::AppConfig::load(&env.config_path()).expect("valid config");
 
     let buffer = Arc::new(RwLock::new(EventBuffer::new(100)));
     let engine = AlertingEngine::new(&config.alerting, buffer.clone());
@@ -38,9 +35,13 @@ async fn engine_populates_event_buffer() {
     });
 
     // Send events
-    tx.send(make_event(Severity::Warning, GuardModule::FsGuard, "test 1"))
-        .await
-        .unwrap();
+    tx.send(make_event(
+        Severity::Warning,
+        GuardModule::FsGuard,
+        "test 1",
+    ))
+    .await
+    .unwrap();
     tx.send(make_event(Severity::High, GuardModule::CdpProxy, "test 2"))
         .await
         .unwrap();
@@ -58,8 +59,7 @@ async fn engine_buffer_respects_capacity() {
     let env = common::TestEnv::new();
     let yaml = common::minimal_monitor_config(&env);
     env.write_config(&yaml);
-    let config =
-        counterclaw::config::AppConfig::load(&env.config_path()).expect("valid config");
+    let config = counterclaw::config::AppConfig::load(&env.config_path()).expect("valid config");
 
     let buffer = Arc::new(RwLock::new(EventBuffer::new(3))); // Tiny capacity
     let engine = AlertingEngine::new(&config.alerting, buffer.clone());
@@ -109,7 +109,11 @@ async fn engine_continues_after_slack_disabled() {
     engine_handle.await.unwrap();
 
     let buf = buffer.read().unwrap();
-    assert_eq!(buf.len(), 1, "Engine should continue even with Slack disabled");
+    assert_eq!(
+        buf.len(),
+        1,
+        "Engine should continue even with Slack disabled"
+    );
 }
 
 #[tokio::test]
@@ -173,9 +177,13 @@ async fn engine_slack_respects_severity() {
     tx.send(make_event(Severity::Info, GuardModule::System, "info"))
         .await
         .unwrap();
-    tx.send(make_event(Severity::Warning, GuardModule::FsGuard, "warning"))
-        .await
-        .unwrap();
+    tx.send(make_event(
+        Severity::Warning,
+        GuardModule::FsGuard,
+        "warning",
+    ))
+    .await
+    .unwrap();
     tx.send(make_event(
         Severity::Critical,
         GuardModule::CdpProxy,

@@ -10,6 +10,7 @@
 use clap::{Parser, Subcommand};
 use counterclaw::alerting::engine::AlertingEngine;
 use counterclaw::config::{self, default_config_path, expand_tilde};
+use counterclaw::daemon;
 use counterclaw::guards::cdp_proxy::DomainMatcher;
 use counterclaw::guards::cmd_guard::{CommandMatcher, MatchType};
 use counterclaw::guards::fs_guard::{PathMatcher, PathVerdict};
@@ -46,7 +47,11 @@ pub enum Commands {
     },
 
     /// Show current status
-    Status,
+    Status {
+        /// Path to config file
+        #[arg(short, long)]
+        config: Option<String>,
+    },
 
     /// Follow logs
     Logs {
@@ -125,9 +130,7 @@ async fn main() {
         Commands::Daemon { .. } => {
             println!("Daemon mode will be available in a future version.");
         }
-        Commands::Status => {
-            println!("Status command will be available in a future version.");
-        }
+        Commands::Status { config } => cmd_status(config).await,
         Commands::Logs { .. } => {
             println!("Logs command will be available in a future version.");
         }
@@ -256,6 +259,101 @@ fn cmd_test(config_path: Option<String>, target: TestTarget) {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Commande : status — affiche l'état du daemon
+// ---------------------------------------------------------------------------
+
+/// Vérifie si CounterClaw tourne et affiche son état.
+/// Exit code 0 = running, exit code 1 = not running ou erreur.
+async fn cmd_status(config_path: Option<String>) {
+    // 1. Charger la config pour trouver le PID file
+    let path = config_path
+        .map(|p| expand_tilde(&p))
+        .unwrap_or_else(default_config_path);
+
+    let app_config = match config::check_config(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let pid_path = expand_tilde(&app_config.general.pid_file);
+
+    // 2. Lire le PID file
+    let pid = match daemon::read_pid_file(&pid_path) {
+        Some(p) => p,
+        None => {
+            println!("CounterClaw is not running (no PID file)");
+            std::process::exit(1);
+        }
+    };
+
+    // 3. Vérifier si le process existe
+    if !process_exists(pid) {
+        println!("CounterClaw is not running (stale PID file, pid={})", pid);
+        std::process::exit(1);
+    }
+
+    // 4. Appeler le dashboard pour obtenir le statut
+    let url = format!(
+        "http://{}:{}/api/status",
+        app_config.dashboard.bind_address, app_config.dashboard.port
+    );
+
+    match reqwest::get(&url).await {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(json) => {
+                        println!("CounterClaw is running (pid={})", pid);
+                        if let Some(mode) = json.get("mode").and_then(|v| v.as_str()) {
+                            println!("Mode: {}", mode);
+                        }
+                        if let Some(uptime) =
+                            json.get("daemon_uptime_seconds").and_then(|v| v.as_i64())
+                        {
+                            println!("Uptime: {}s", uptime);
+                        }
+                        if let Some(guards) = json.get("guards").and_then(|v| v.as_array()) {
+                            println!("Guards:");
+                            for g in guards {
+                                let name = g.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                                let running =
+                                    g.get("running").and_then(|v| v.as_bool()).unwrap_or(false);
+                                let status = if running { "running" } else { "stopped" };
+                                println!("  {} — {}", name, status);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        println!(
+                            "CounterClaw is running (pid={}) but dashboard returned invalid data",
+                            pid
+                        );
+                    }
+                }
+            } else {
+                println!("CounterClaw dashboard unreachable (HTTP {})", resp.status());
+                std::process::exit(1);
+            }
+        }
+        Err(_) => {
+            println!("CounterClaw dashboard unreachable (connection refused or not responding)");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Vérifie si un process avec ce PID existe.
+fn process_exists(pid: u32) -> bool {
+    let s = sysinfo::System::new_with_specifics(
+        sysinfo::RefreshKind::new().with_processes(sysinfo::ProcessRefreshKind::new()),
+    );
+    s.process(sysinfo::Pid::from_u32(pid)).is_some()
 }
 
 // ---------------------------------------------------------------------------

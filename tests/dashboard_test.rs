@@ -58,12 +58,7 @@ fn setup_state_with_events() -> Arc<DaemonState> {
 
 async fn get(app: axum::Router, uri: &str) -> (StatusCode, String) {
     let response = app
-        .oneshot(
-            Request::builder()
-                .uri(uri)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
         .await
         .unwrap();
 
@@ -99,7 +94,10 @@ async fn health_includes_timestamp() {
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert!(json["timestamp"].is_string(), "Should include timestamp");
     let ts = json["timestamp"].as_str().unwrap();
-    assert!(ts.contains("UTC") || ts.contains("T"), "Should be a valid timestamp format");
+    assert!(
+        ts.contains("UTC") || ts.contains("T"),
+        "Should be a valid timestamp format"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -127,10 +125,7 @@ async fn status_lists_guards() {
     let guards = json["guards"].as_array().expect("guards should be array");
     assert_eq!(guards.len(), 4, "Should list all 4 guards");
 
-    let names: Vec<&str> = guards
-        .iter()
-        .map(|g| g["name"].as_str().unwrap())
-        .collect();
+    let names: Vec<&str> = guards.iter().map(|g| g["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"fs_guard"));
     assert!(names.contains(&"cdp_proxy"));
     assert!(names.contains(&"net_guard"));

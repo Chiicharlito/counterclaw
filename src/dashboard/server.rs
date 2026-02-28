@@ -196,8 +196,7 @@ async fn config_handler(
     State(state): State<Arc<DaemonState>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     // Sérialiser la config puis redact les champs sensibles
-    let mut config_json =
-        serde_json::to_value(&state.config).unwrap_or(serde_json::Value::Null);
+    let mut config_json = serde_json::to_value(&state.config).unwrap_or(serde_json::Value::Null);
 
     // Redact Slack webhook URL
     if let Some(alerting) = config_json.get_mut("alerting") {
