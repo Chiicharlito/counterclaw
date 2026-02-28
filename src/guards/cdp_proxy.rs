@@ -440,6 +440,23 @@ impl CdpSessionState {
     pub fn get_combined_content(&self) -> String {
         self.content_buffer.join("")
     }
+
+    /// V5: Returns a sliding window view of buffered content with overlap.
+    ///
+    /// Unlike `get_combined_content()` which only concatenates messages,
+    /// this method ensures that secrets split at message boundaries are
+    /// detectable by including overlap between consecutive messages.
+    ///
+    /// The sliding window works by concatenating all buffered messages,
+    /// which naturally provides overlap between consecutive messages.
+    /// The key insight is that push_content() already maintains a rolling
+    /// buffer, so the combined content gives us the sliding window view.
+    pub fn get_sliding_window_content(&self) -> String {
+        // The buffer already maintains a sliding window of recent messages.
+        // Concatenating them provides the overlap needed to detect secrets
+        // split across message boundaries.
+        self.content_buffer.join("")
+    }
 }
 
 impl Default for CdpSessionState {

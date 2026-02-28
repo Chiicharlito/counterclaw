@@ -295,8 +295,8 @@ async fn accepts_rule_at_max_length() {
     let ds = DashboardState::new(state);
     let app = build_router(ds);
 
-    // Create a value of exactly 500 chars
-    let value = "a".repeat(500);
+    // Create a valid domain of exactly 500 chars (V7: must be valid domain format)
+    let value = format!("{}.example.com", "a".repeat(500 - 12));
     let body = format!(r#"{{"category": "blocked", "value": "{}"}}"#, value);
 
     let (status, _, _) =

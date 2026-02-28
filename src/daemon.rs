@@ -84,6 +84,35 @@ pub fn remove_pid_file(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
+/// Écrit un token API dans un fichier avec permissions restrictives (0600).
+///
+/// Le fichier est protégé contre la lecture par d'autres utilisateurs.
+/// Le token est écrit en texte brut (une seule ligne).
+pub fn write_token_file(path: &Path, token: &str) -> anyhow::Result<()> {
+    // Create parent directory if needed
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+
+    write!(file, "{}", token)?;
+
+    // Set permissions to 0600 (owner read/write only)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // DaemonState — état partagé du daemon
 // ---------------------------------------------------------------------------
@@ -222,9 +251,24 @@ impl Daemon {
         // Démarrer les guards
         state.start_guards(alert_tx.clone()).await;
 
+        // Générer et sauvegarder le token API (V1: auth obligatoire)
+        let api_token = crate::dashboard::server::generate_api_token();
+        let token_dir = pid_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(crate::config::counterclaw_dir);
+        let token_path = token_dir.join("api.token");
+        match write_token_file(&token_path, &api_token) {
+            Ok(()) => tracing::info!("API token written to {:?}", token_path),
+            Err(e) => tracing::error!("Failed to write API token: {}", e),
+        }
+
         // Démarrer le dashboard HTTP si activé
         let dashboard_handle = if dashboard_enabled {
-            let dashboard_state = crate::dashboard::server::DashboardState::new(Arc::clone(&state));
+            let dashboard_state = crate::dashboard::server::DashboardState::with_token(
+                Arc::clone(&state),
+                api_token.clone(),
+            );
             let router = crate::dashboard::server::build_router(dashboard_state);
             match tokio::net::TcpListener::bind(&dashboard_addr).await {
                 Ok(listener) => {
@@ -256,13 +300,30 @@ impl Daemon {
         );
         let _ = alert_tx.send(startup).await;
 
-        // Attendre Ctrl+C
-        match tokio::signal::ctrl_c().await {
-            Ok(()) => {
-                tracing::info!("Received shutdown signal");
+        // Attendre Ctrl+C ou SIGTERM (V2: graceful shutdown sur les deux signaux)
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("Failed to create SIGTERM listener");
+
+            tokio::select! {
+                result = tokio::signal::ctrl_c() => {
+                    match result {
+                        Ok(()) => tracing::info!("Received Ctrl+C — shutting down gracefully"),
+                        Err(e) => tracing::error!("Failed to listen for Ctrl+C: {}", e),
+                    }
+                }
+                _ = sigterm.recv() => {
+                    tracing::info!("Received SIGTERM — shutting down gracefully");
+                }
             }
-            Err(e) => {
-                tracing::error!("Failed to listen for Ctrl+C: {}", e);
+        }
+        #[cfg(not(unix))]
+        {
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => tracing::info!("Received Ctrl+C — shutting down gracefully"),
+                Err(e) => tracing::error!("Failed to listen for Ctrl+C: {}", e),
             }
         }
 
