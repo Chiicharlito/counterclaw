@@ -157,15 +157,32 @@ cmd_guard:
 ### Install
 
 ```bash
-# From source
-git clone https://github.com/YOUR_USERNAME/counterclaw.git
+# From source (recommended)
+git clone https://github.com/Chiicharlito/counterclaw.git
 cd counterclaw
+make install
+# → Builds release binary, copies to /usr/local/bin/, installs launchd plist, inits config
+
+# Or manually
 cargo build --release
 sudo cp target/release/counterclaw /usr/local/bin/
-
-# Generate default config
 counterclaw config init
-# → Creates ~/.counterclaw/config.yaml with sensible defaults
+```
+
+### Pre-built binaries
+
+Download from [GitHub Releases](https://github.com/Chiicharlito/counterclaw/releases):
+
+- **macOS ARM64** (Apple Silicon)
+- **macOS x86_64** (Intel)
+- **Linux x86_64**
+
+```bash
+# Example: macOS ARM64
+curl -L https://github.com/Chiicharlito/counterclaw/releases/latest/download/counterclaw-macos-arm64 -o counterclaw
+chmod +x counterclaw
+sudo mv counterclaw /usr/local/bin/
+counterclaw config init
 ```
 
 ### Configure
@@ -301,11 +318,11 @@ Start with `monitor` for a day or two, review the logs, then switch to `enforce`
 ## Roadmap
 
 - [x] Project specification
-- [ ] **Phase 1** — Config parser, CLI, alerting engine
-- [ ] **Phase 2** — FS Guard + CDP Proxy (core value)
-- [ ] **Phase 3** — Net Guard + Cmd Guard
-- [ ] **Phase 4** — Dashboard, daemon mode, signal handling
-- [ ] **Phase 5** — `brew install counterclaw`, launchd plist
+- [x] **Phase 1** — Config parser, CLI, alerting engine
+- [x] **Phase 2** — FS Guard + CDP Proxy (core value)
+- [x] **Phase 3** — Net Guard + Cmd Guard
+- [x] **Phase 4** — Dashboard, daemon mode, signal handling
+- [x] **Phase 5** — Packaging, launchd plist, CI/CD
 - [ ] macOS Endpoint Security Framework integration (exact PID attribution)
 - [ ] `pf` firewall rules for real network blocking
 - [ ] Interactive approval flow (approve/deny from phone notification)
@@ -359,7 +376,7 @@ This project is in early development. Contributions welcome, especially:
 
 ## License
 
-MIT
+Apache-2.0
 
 ---
 

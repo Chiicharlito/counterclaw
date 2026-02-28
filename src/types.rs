@@ -6,6 +6,7 @@
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::fmt;
 use tokio::sync::mpsc;
 
@@ -234,4 +235,84 @@ pub enum CounterClawError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+// ---------------------------------------------------------------------------
+// EventBuffer — buffer circulaire pour le dashboard
+// ---------------------------------------------------------------------------
+
+/// Buffer circulaire d'événements de sécurité.
+/// Évince les plus anciens quand la capacité est atteinte.
+/// Utilisé par le dashboard pour exposer les événements récents via l'API.
+pub struct EventBuffer {
+    events: VecDeque<SecurityEvent>,
+    max_capacity: usize,
+}
+
+impl EventBuffer {
+    /// Crée un nouveau buffer avec la capacité maximale donnée.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            events: VecDeque::with_capacity(capacity.min(1024)),
+            max_capacity: capacity,
+        }
+    }
+
+    /// Ajoute un événement. Évince le plus ancien si le buffer est plein.
+    pub fn push(&mut self, event: SecurityEvent) {
+        if self.events.len() >= self.max_capacity {
+            self.events.pop_front();
+        }
+        self.events.push_back(event);
+    }
+
+    /// Retourne le nombre d'événements dans le buffer.
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    /// Retourne true si le buffer est vide.
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    /// Requête filtrée sur le buffer.
+    /// - limit: nombre max de résultats (0 = pas de limite)
+    /// - min_severity: filtre par sévérité minimale (None = pas de filtre)
+    /// - module: filtre par module (None = pas de filtre)
+    /// - since: filtre par timestamp (None = pas de filtre)
+    pub fn query(
+        &self,
+        limit: usize,
+        min_severity: Option<&Severity>,
+        module: Option<&GuardModule>,
+        since: Option<DateTime<Utc>>,
+    ) -> Vec<&SecurityEvent> {
+        let iter = self.events.iter().rev(); // Most recent first
+
+        let filtered = iter.filter(|e| {
+            if let Some(sev) = min_severity {
+                if e.severity < *sev {
+                    return false;
+                }
+            }
+            if let Some(m) = module {
+                if e.module != *m {
+                    return false;
+                }
+            }
+            if let Some(ts) = since {
+                if e.timestamp < ts {
+                    return false;
+                }
+            }
+            true
+        });
+
+        if limit > 0 {
+            filtered.take(limit).collect()
+        } else {
+            filtered.collect()
+        }
+    }
 }

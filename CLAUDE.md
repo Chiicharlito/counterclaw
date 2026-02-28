@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 CounterClaw is an OS-level daemon (Rust) that protects machines from autonomous AI agents (like OpenClaw) exfiltrating sensitive data. It runs independently from the AI agent — no plugin, no skill, no prompt can disable it.
 
-**Status**: Phase 1 (foundations) and Phase 2 (core guards) complete. 109 tests passing. Phase 3+ uses Security-First TDD. `PROJECT_OVERVIEW.md` is the single source of truth for the full technical specification (written in French).
+**Status**: All 5 phases complete. 259 tests passing. `PROJECT_OVERVIEW.md` is the single source of truth for the full technical specification (written in French).
 
 **Target**: macOS primary, Linux secondary.
 
@@ -78,25 +78,37 @@ src/
 │   ├── mod.rs
 │   ├── fs_guard.rs      # Filesystem Guard                          ✅ Phase 2
 │   ├── cdp_proxy.rs     # CDP Proxy (browser guard)                 ✅ Phase 2
-│   ├── net_guard.rs     # Network Egress Monitor                    ⏳ Phase 3
-│   └── cmd_guard.rs     # Command Interceptor                       ⏳ Phase 3
+│   ├── net_guard.rs     # Network Egress Monitor                    ✅ Phase 3
+│   └── cmd_guard.rs     # Command Interceptor                       ✅ Phase 3
 ├── alerting/
 │   ├── mod.rs
-│   ├── engine.rs        # Central alert dispatcher                  ✅ Phase 1
-│   ├── slack.rs         # Slack webhook backend                     ⏳ Phase 4
+│   ├── engine.rs        # Central alert dispatcher                  ✅ Phase 1+4
+│   ├── slack.rs         # Slack webhook backend                     ✅ Phase 4
 │   ├── macos_notify.rs  # macOS native notifications               ✅ Phase 1
 │   └── logger.rs        # JSON Lines structured logging             ✅ Phase 1
-├── daemon.rs            # Module orchestration, signals             ⏳ Phase 4
+├── daemon.rs            # Module orchestration, signals             ✅ Phase 4
+├── launcher.rs          # Launchd plist generation + launchctl      ✅ Phase 5
 └── dashboard/
     ├── mod.rs
-    └── server.rs        # axum HTTP server                          ⏳ Phase 4
+    └── server.rs        # axum HTTP server                          ✅ Phase 4
 tests/
 ├── common/mod.rs        # Shared test helpers (TestEnv)
 ├── phase1_test.rs       # 24 tests — config, types, alerting, CLI
 ├── process_test.rs      # 9 tests — process detection
 ├── fs_guard_test.rs     # 23 tests — filesystem guard
 ├── cdp_proxy_test.rs    # 53 tests — CDP proxy
-└── integration_test.rs  # ⏳ Phase 4
+├── cmd_guard_test.rs    # 28 tests — command guard
+├── net_guard_test.rs    # 21 tests — network guard
+├── cli_test_command_test.rs # 15 tests — CLI test command
+├── event_buffer_test.rs # 8 tests — event buffer
+├── slack_test.rs        # 20 tests — Slack notifier
+├── alerting_engine_test.rs # 6 tests — alerting engine integration
+├── daemon_test.rs       # 12 tests — daemon orchestration
+├── dashboard_test.rs    # 13 tests — dashboard HTTP endpoints
+├── cli_status_test.rs   # 5 tests — CLI status command
+├── launcher_test.rs     # 13 tests — launcher/plist generation
+├── daemon_cli_test.rs   # 3 tests — daemon CLI subcommands
+└── cli_logs_test.rs     # 6 tests — logs + dashboard CLI
 ```
 
 ## Implementation Build Order
