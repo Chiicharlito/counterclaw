@@ -213,7 +213,8 @@ fn cmd_test(config_path: Option<String>, target: TestTarget) {
                 app_config.fs_guard.allowed_paths.clone(),
             );
             let expanded = expand_tilde(&test_path);
-            let verdict = matcher.check(&expanded);
+            let mode = app_config.operation_mode();
+            let verdict = matcher.check(&expanded, &mode);
             match verdict {
                 PathVerdict::Blocked => {
                     println!("BLOCKED — path is in blocked_paths");
@@ -233,7 +234,8 @@ fn cmd_test(config_path: Option<String>, target: TestTarget) {
         }
         TestTarget::Domain { domain } => {
             let matcher = DomainMatcher::new(&app_config.cdp_proxy.domains);
-            let verdict = matcher.check(&domain);
+            let mode = app_config.operation_mode();
+            let verdict = matcher.check(&domain, &mode);
             match verdict {
                 counterclaw::guards::cdp_proxy::DomainVerdict::Blocked => {
                     println!("BLOCKED — domain is in blocked list");
@@ -249,7 +251,8 @@ fn cmd_test(config_path: Option<String>, target: TestTarget) {
         }
         TestTarget::Command { command } => {
             let matcher = CommandMatcher::new(&app_config.cmd_guard);
-            match matcher.match_command(&command) {
+            let mode = app_config.operation_mode();
+            match matcher.match_command(&command, &mode) {
                 Some(verdict) => match verdict.match_type {
                     MatchType::Blacklisted => {
                         println!("BLOCKED [{}] — {}", verdict.severity, verdict.description);

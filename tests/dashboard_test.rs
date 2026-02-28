@@ -221,6 +221,71 @@ async fn config_shows_enabled_status() {
 // parse_duration
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// GET / — Dashboard HTML
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn dashboard_root_returns_html() {
+    let state = setup_state();
+    let app = build_router(state);
+    let (status, body) = get(app, "/").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("<html"), "Body should contain HTML markup");
+    assert!(
+        body.contains("CounterClaw"),
+        "Body should contain CounterClaw title"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_root_contains_api_references() {
+    let state = setup_state();
+    let app = build_router(state);
+    let (_, body) = get(app, "/").await;
+
+    assert!(
+        body.contains("/api/status"),
+        "HTML should reference /api/status endpoint"
+    );
+    assert!(
+        body.contains("/api/events"),
+        "HTML should reference /api/events endpoint"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GET /health, /status — shortcut routes
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn health_shortcut_works() {
+    let state = setup_state();
+    let app = build_router(state);
+    let (status, body) = get(app, "/health").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["status"], "ok");
+}
+
+#[tokio::test]
+async fn status_shortcut_works() {
+    let state = setup_state();
+    let app = build_router(state);
+    let (status, body) = get(app, "/status").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["mode"], "monitor");
+    assert!(json["guards"].is_array(), "Should include guards array");
+}
+
+// ---------------------------------------------------------------------------
+// parse_duration
+// ---------------------------------------------------------------------------
+
 #[test]
 fn parse_duration_hours() {
     let d = parse_duration("2h");

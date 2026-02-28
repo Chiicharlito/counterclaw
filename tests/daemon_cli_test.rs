@@ -2,6 +2,7 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use tempfile::TempDir;
 
 #[test]
 fn daemon_subcommand_appears_in_help() {
@@ -25,10 +26,14 @@ fn daemon_start_appears_in_help() {
 
 #[test]
 fn daemon_stop_prints_message_when_not_loaded() {
-    // When plist doesn't exist, daemon stop should fail with a useful message
+    // Override HOME so plist_install_path resolves to a temp dir where no plist exists.
+    // This isolates the test from the real ~/Library/LaunchAgents/.
+    let fake_home = TempDir::new().expect("Failed to create temp dir");
+
     Command::cargo_bin("counterclaw")
         .unwrap()
         .args(["daemon", "stop"])
+        .env("HOME", fake_home.path())
         .assert()
         .failure()
         .stderr(

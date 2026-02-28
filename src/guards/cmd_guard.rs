@@ -107,7 +107,13 @@ impl CommandMatcher {
     /// Vérifie une commande contre toutes les règles.
     /// Retourne None si aucun match, Some(verdict) sinon.
     /// Priorité : Blacklist > RequireApproval.
-    pub fn match_command(&self, command: &str) -> Option<CommandVerdict> {
+    ///
+    /// En mode Paranoid, une commande non-matchée est traitée comme blacklistée (default:deny).
+    pub fn match_command(
+        &self,
+        command: &str,
+        mode: &crate::types::OperationMode,
+    ) -> Option<CommandVerdict> {
         // Commande vide ou whitespace-only → pas de match
         if command.trim().is_empty() {
             return None;
@@ -135,6 +141,16 @@ impl CommandMatcher {
                     pattern: pattern.raw_pattern.clone(),
                 });
             }
+        }
+
+        // Default:deny en mode Paranoid — toute commande non-matchée est bloquée
+        if *mode == crate::types::OperationMode::Paranoid {
+            return Some(CommandVerdict {
+                match_type: MatchType::Blacklisted,
+                severity: Severity::Warning,
+                description: "Command not explicitly allowed (paranoid mode)".to_string(),
+                pattern: String::new(),
+            });
         }
 
         None
