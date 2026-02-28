@@ -631,7 +631,7 @@ impl CdpDecision {
 /// pour prendre une décision sur un message CDP.
 ///
 /// C'est une fonction libre (pas une méthode) : respecte SRP.
-/// Fail-open pour les messages non-parsables.
+/// Fail-closed: malformed/non-object JSON is blocked, not forwarded.
 ///
 /// Security checks performed:
 /// 1. Message size limit (10 MB max)
@@ -663,10 +663,27 @@ pub fn process_cdp_message(
         };
     }
 
-    // Tenter de parser le message
+    // Fail-closed: reject anything that isn't a valid JSON object.
+    // An agent could send malformed JSON, JSON arrays (batch requests),
+    // or non-object types to bypass all CDP inspection.
+    let trimmed = raw.trim();
+    if !trimmed.starts_with('{') {
+        return CdpDecision::Block {
+            id: 0,
+            reason: "Unparseable CDP message blocked (not a JSON object)".to_string(),
+            severity: Severity::High,
+        };
+    }
+
     let msg = match parse_cdp_message(raw) {
         Some(m) => m,
-        None => return CdpDecision::Forward, // Fail-open pour JSON malformé
+        None => {
+            return CdpDecision::Block {
+                id: 0,
+                reason: "Unparseable CDP message blocked (invalid JSON)".to_string(),
+                severity: Severity::High,
+            };
+        }
     };
 
     // Les event messages (pas d'id) sont toujours forwardés

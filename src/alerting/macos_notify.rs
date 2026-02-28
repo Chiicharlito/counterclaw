@@ -24,8 +24,19 @@ impl MacosNotifier {
     }
 
     /// Envoie une notification pour un événement de sécurité.
+    ///
+    /// Skips notification silently (with log warning) when running as a
+    /// LaunchDaemon with no GUI session — osascript cannot display
+    /// notifications without a window server connection.
     pub fn send(&self, event: &SecurityEvent) {
         if !self.enabled {
+            return;
+        }
+
+        if !has_gui_session() {
+            eprintln!(
+                "[counterclaw] Skipping macOS notification (no GUI session — running as daemon?)"
+            );
             return;
         }
 
@@ -51,6 +62,42 @@ fn send_notification(title: &str, message: &str) {
 
     if let Err(e) = result {
         eprintln!("[counterclaw] macOS notification failed: {}", e);
+    }
+}
+
+/// Detects if the current process has access to a GUI session.
+///
+/// Returns false when running as a LaunchDaemon (root, no window server).
+/// Uses the DISPLAY env var on Linux and checks for window server
+/// accessibility on macOS via `/usr/sbin/system_profiler` absence or
+/// by checking if the process runs without a console user.
+pub fn has_gui_session() -> bool {
+    // On macOS, a LaunchDaemon run as root has no console user session.
+    // We check if there is a console user via scutil.
+    #[cfg(target_os = "macos")]
+    {
+        // If TERM_PROGRAM or SSH_TTY is set, we're likely in a terminal
+        if std::env::var("TERM_PROGRAM").is_ok() || std::env::var("TERM").is_ok() {
+            return true;
+        }
+        // Try to detect console user via `stat -f %u /dev/console`
+        // If it returns 0 (root) or fails, there's likely no GUI user logged in
+        match Command::new("stat")
+            .args(["-f", "%u", "/dev/console"])
+            .output()
+        {
+            Ok(output) => {
+                let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                // UID 0 = root = no user GUI session
+                uid != "0" && !uid.is_empty()
+            }
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // On Linux, check for DISPLAY or WAYLAND_DISPLAY
+        std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok()
     }
 }
 

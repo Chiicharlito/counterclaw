@@ -692,7 +692,7 @@ fn inspects_content_blocks_api_key() {
     );
 }
 
-/// Un JSON malformé est forwardé (fail-open).
+/// Un JSON malformé est bloqué (fail-closed — Security Audit #3 V1).
 #[test]
 fn handles_malformed_json() {
     let config = test_cdp_config();
@@ -711,8 +711,8 @@ fn handles_malformed_json() {
         &default_mode(),
     );
     assert!(
-        matches!(decision, CdpDecision::Forward),
-        "Malformed JSON should be forwarded (fail-open), got {:?}",
+        matches!(decision, CdpDecision::Block { .. }),
+        "Malformed JSON should be blocked (fail-closed), got {:?}",
         decision
     );
 }
