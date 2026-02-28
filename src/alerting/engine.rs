@@ -12,7 +12,6 @@ use crate::alerting::macos_notify::MacosNotifier;
 use crate::alerting::slack::SlackNotifier;
 use crate::config::AlertingConfig;
 use crate::types::{ActionTaken, EventBuffer, GuardModule, SecurityEvent, Severity};
-use chrono::{DateTime, Utc};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -130,7 +129,11 @@ impl AlertingEngine {
             self.kill_switch.check_reset();
             self.kill_switch.record_event(&event);
             if self.kill_switch.should_trigger() {
-                self.kill_switch.execute(&self.logger, &self.notifier);
+                let kill_event = self.kill_switch.execute(&self.logger, &self.notifier);
+                // Push kill switch event to buffer for visibility
+                if let Ok(mut buf) = self.event_buffer.write() {
+                    buf.push(kill_event);
+                }
             }
         }
 
@@ -146,13 +149,18 @@ impl AlertingEngine {
 /// Le kill switch surveille le rythme des violations.
 /// Si N violations de gravité >= seuil arrivent en M secondes,
 /// il déclenche une action d'urgence (log + notification pour le MVP).
+///
+/// V9: Uses std::time::Instant (monotonic clock) for window tracking instead of
+/// Utc::now() which can be manipulated by setting the system clock back.
 struct KillSwitch {
     enabled: bool,
     threshold_severity: Severity,
     threshold_count: usize,
-    threshold_window_seconds: i64,
+    threshold_window_seconds: u64,
     action: String,
-    recent_events: VecDeque<DateTime<Utc>>,
+    /// V9: Monotonic timestamps for violation window tracking.
+    /// Using Instant instead of DateTime<Utc> to prevent clock manipulation attacks.
+    recent_violations: VecDeque<Instant>,
     triggered: bool,
 }
 
@@ -170,57 +178,70 @@ impl KillSwitch {
             enabled: config.enabled,
             threshold_severity,
             threshold_count: config.threshold_count as usize,
-            threshold_window_seconds: config.threshold_window_seconds as i64,
+            threshold_window_seconds: config.threshold_window_seconds,
             action: config.action.clone(),
-            recent_events: VecDeque::new(),
+            recent_violations: VecDeque::new(),
             triggered: false,
         }
     }
 
     /// Enregistre un événement dans la fenêtre glissante.
+    /// V9: Uses Instant (monotonic clock) instead of Utc::now() to prevent
+    /// clock manipulation attacks where an attacker sets the system time back.
     fn record_event(&mut self, event: &SecurityEvent) {
         if !self.enabled || event.severity < self.threshold_severity {
             return;
         }
 
-        self.recent_events.push_back(event.timestamp);
+        let now = Instant::now();
+        self.recent_violations.push_back(now);
 
-        // Nettoyer les événements hors de la fenêtre
-        let cutoff = Utc::now() - chrono::Duration::seconds(self.threshold_window_seconds);
-        while self.recent_events.front().is_some_and(|t| *t < cutoff) {
-            self.recent_events.pop_front();
+        // Nettoyer les violations hors de la fenêtre (monotonic)
+        let window = std::time::Duration::from_secs(self.threshold_window_seconds);
+        while let Some(front) = self.recent_violations.front() {
+            if now.duration_since(*front) > window {
+                self.recent_violations.pop_front();
+            } else {
+                break;
+            }
         }
     }
 
     /// Reset the kill switch if the time window has passed with no recent violations.
-    /// This allows the system to recover from transient bursts of events.
+    /// V9: Uses Instant for monotonic timing.
     fn check_reset(&mut self) {
         if !self.triggered {
             return;
         }
-        let cutoff = Utc::now() - chrono::Duration::seconds(self.threshold_window_seconds);
-        // If all recent events are outside the window, reset
-        let has_recent = self.recent_events.iter().any(|t| *t >= cutoff);
+        let now = Instant::now();
+        let window = std::time::Duration::from_secs(self.threshold_window_seconds);
+
+        // If all recent violations are outside the window, reset
+        let has_recent = self
+            .recent_violations
+            .iter()
+            .any(|t| now.duration_since(*t) <= window);
         if !has_recent {
             self.triggered = false;
-            self.recent_events.clear();
+            self.recent_violations.clear();
             tracing::info!("Kill switch reset — no recent violations in window");
         }
     }
 
     /// Vérifie si le seuil est atteint.
     fn should_trigger(&self) -> bool {
-        self.enabled && !self.triggered && self.recent_events.len() >= self.threshold_count
+        self.enabled && !self.triggered && self.recent_violations.len() >= self.threshold_count
     }
 
     /// Exécute l'action du kill switch.
     /// En MVP : log + notification. Le vrai kill de process viendra en Phase 2.
-    fn execute(&mut self, logger: &EventLogger, notifier: &MacosNotifier) {
+    /// Returns the kill switch SecurityEvent for buffer storage.
+    fn execute(&mut self, logger: &EventLogger, notifier: &MacosNotifier) -> SecurityEvent {
         self.triggered = true;
 
         let description = format!(
             "Kill switch triggered: {} violations in {}s window (action: {})",
-            self.recent_events.len(),
+            self.recent_violations.len(),
             self.threshold_window_seconds,
             self.action
         );
@@ -236,5 +257,6 @@ impl KillSwitch {
 
         logger.log(&event);
         notifier.send(&event);
+        event
     }
 }

@@ -17,16 +17,36 @@ use tokio::sync::mpsc;
 // Self-protection paths — always blocked regardless of mode or user config
 // ---------------------------------------------------------------------------
 
-/// Paths that CounterClaw uses for its own operation.
+/// System-level paths that CounterClaw uses for its own operation.
 /// These are ALWAYS blocked to prevent an agent from tampering with the daemon.
 /// Matching is hierarchical: any file under these directories is also blocked.
-pub const SELF_PROTECTION_PATHS: &[&str] = &[
+const SYSTEM_PROTECTION_PATHS: &[&str] = &[
     "/etc/counterclaw/",
     "/var/log/counterclaw/",
     "/var/run/counterclaw.pid",
     "/Library/LaunchDaemons/io.counterclaw.daemon.plist",
     "/usr/local/bin/counterclaw",
 ];
+
+/// Returns the complete list of self-protection paths (system + user-mode).
+///
+/// V3: Includes ~/.counterclaw/ to protect user-mode config, logs, and API token.
+/// The user home directory is resolved at runtime.
+pub fn get_self_protection_paths() -> Vec<String> {
+    let mut paths: Vec<String> = SYSTEM_PROTECTION_PATHS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    // Add user-mode paths (V3: protect ~/.counterclaw/)
+    if let Some(home) = dirs::home_dir() {
+        let user_dir = home.join(".counterclaw");
+        // Add with trailing slash for hierarchical matching
+        paths.push(format!("{}/", user_dir.display()));
+    }
+
+    paths
+}
 
 // ---------------------------------------------------------------------------
 // PathVerdict — résultat du matching d'un chemin
@@ -186,22 +206,24 @@ impl PathMatcher {
     /// Checks if a normalized path matches any self-protection path.
     /// Self-protection matching is hierarchical: a file under a protected
     /// directory is also protected.
+    /// V3: Uses get_self_protection_paths() for both system and user-mode paths.
     fn matches_self_protection(normalized: &Path) -> bool {
         let path_str = normalized.to_string_lossy();
-        for sp in SELF_PROTECTION_PATHS {
+        let protection_paths = get_self_protection_paths();
+        for sp in &protection_paths {
             // For directory paths (ending with /), use hierarchical matching
             if sp.ends_with('/') {
-                if path_str.starts_with(sp) {
+                if path_str.starts_with(sp.as_str()) {
                     return true;
                 }
                 // Also match the directory itself without trailing slash
                 let without_slash = sp.trim_end_matches('/');
-                if path_str == without_slash {
+                if *path_str == *without_slash {
                     return true;
                 }
             } else {
                 // Exact file match
-                if path_str == *sp {
+                if *path_str == *sp {
                     return true;
                 }
             }
@@ -235,6 +257,7 @@ impl PathMatcher {
     /// Vérifie si un chemin normalisé matche une liste (exact + glob).
     /// Le matching hiérarchique est pris en compte : si `/a/b` est dans la liste,
     /// alors `/a/b/c/d` matche aussi.
+    /// V4: Sur macOS, le matching est case-insensitive (APFS est case-insensitive).
     fn matches_list(
         &self,
         normalized: &Path,
@@ -246,23 +269,61 @@ impl PathMatcher {
             // Canonicaliser aussi le chemin de la règle
             let rule_path = Self::normalize(blocked_path);
 
-            // Match exact
-            if normalized == rule_path {
-                return true;
+            // V4: On macOS, compare case-insensitively
+            #[cfg(target_os = "macos")]
+            {
+                let norm_lower = normalized.to_string_lossy().to_lowercase();
+                let rule_lower = rule_path.to_string_lossy().to_lowercase();
+
+                // Match exact (case-insensitive)
+                if norm_lower == rule_lower {
+                    return true;
+                }
+
+                // Match hiérarchique (case-insensitive)
+                if norm_lower.starts_with(&rule_lower)
+                    && (rule_lower.ends_with('/')
+                        || norm_lower.as_bytes().get(rule_lower.len()) == Some(&b'/'))
+                {
+                    return true;
+                }
             }
 
-            // Match hiérarchique : le chemin est un enfant du chemin bloqué
-            // On vérifie que c'est un vrai sous-répertoire (pas juste un préfixe de nom).
-            if normalized.starts_with(&rule_path) {
-                return true;
+            #[cfg(not(target_os = "macos"))]
+            {
+                // Match exact
+                if normalized == rule_path {
+                    return true;
+                }
+
+                // Match hiérarchique
+                if normalized.starts_with(&rule_path) {
+                    return true;
+                }
             }
         }
 
         // Match glob
+        // V4: Sur macOS, utiliser case-insensitive matching
         let path_str = normalized.to_string_lossy();
+        #[cfg(target_os = "macos")]
+        let match_options = glob::MatchOptions {
+            case_sensitive: false,
+            ..Default::default()
+        };
+
         for pattern in glob_patterns {
-            if pattern.matches(&path_str) {
-                return true;
+            #[cfg(target_os = "macos")]
+            {
+                if pattern.matches_with(&path_str, match_options) {
+                    return true;
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                if pattern.matches(&path_str) {
+                    return true;
+                }
             }
         }
 
@@ -347,6 +408,9 @@ pub struct FsGuard {
     events_total: Arc<AtomicU64>,
     events_blocked: Arc<AtomicU64>,
     start_time: Arc<std::sync::Mutex<Option<chrono::DateTime<Utc>>>>,
+    /// V13: Watchdog — tracks the last time an event was processed.
+    /// Used to detect if the notify watcher has stalled.
+    last_activity: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 impl FsGuard {
@@ -358,6 +422,24 @@ impl FsGuard {
             events_total: Arc::new(AtomicU64::new(0)),
             events_blocked: Arc::new(AtomicU64::new(0)),
             start_time: Arc::new(std::sync::Mutex::new(None)),
+            last_activity: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// V13: Checks if the watchdog is healthy.
+    ///
+    /// Returns true if:
+    /// - The guard is not running (no watchdog needed)
+    /// - The guard has not been running long enough (grace period)
+    /// - The last activity was within the watchdog timeout (300s default)
+    pub fn is_watchdog_healthy(&self) -> bool {
+        if !self.running.load(Ordering::SeqCst) {
+            return true;
+        }
+        let activity = self.last_activity.lock().expect("watchdog lock");
+        match *activity {
+            Some(last) => last.elapsed().as_secs() < 300,
+            None => true, // No activity yet — still in grace period
         }
     }
 
@@ -410,6 +492,8 @@ impl Guard for FsGuard {
     async fn start(&self, _alert_tx: mpsc::Sender<SecurityEvent>) -> anyhow::Result<()> {
         self.running.store(true, Ordering::SeqCst);
         *self.start_time.lock().expect("lock poisoned") = Some(Utc::now());
+        // V13: Initialize watchdog timestamp at start
+        *self.last_activity.lock().expect("watchdog lock") = Some(std::time::Instant::now());
 
         // Phase 2 MVP : le watcher notify est lancé ici.
         // Pour les tests unitaires, on valide le lifecycle (start/stop/status).
