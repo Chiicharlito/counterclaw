@@ -190,6 +190,20 @@ impl DashboardState {
             rate_limiter: Arc::new(std::sync::Mutex::new(RateLimiter::new())),
         }
     }
+
+    /// Returns true if read endpoints require Bearer auth.
+    ///
+    /// Auth is required on reads when:
+    /// - `dashboard.require_auth_for_reads` is true in config, OR
+    /// - The daemon is running in paranoid mode (forced regardless of config)
+    pub fn requires_auth_for_reads(&self) -> bool {
+        let config = self.daemon_state.config.read().expect("config read lock");
+        if config.dashboard.require_auth_for_reads {
+            return true;
+        }
+        // Paranoid mode forces auth on all endpoints
+        config.operation_mode() == crate::types::OperationMode::Paranoid
+    }
 }
 
 /// Generate a random 64-character hex API token (32 bytes of entropy).
@@ -783,7 +797,9 @@ async fn health_handler(
     headers: HeaderMap,
 ) -> Result<Json<HealthResponse>, StatusCode> {
     check_rate_limit(&state, "read", false)?;
-    let _ = &headers; // consumed for rate limit key (future: per-IP)
+    if state.requires_auth_for_reads() {
+        validate_auth(&state, &headers)?;
+    }
     Ok(Json(HealthResponse {
         status: "ok".to_string(),
         timestamp: Utc::now().format("%Y-%m-%dT%H:%M:%S UTC").to_string(),
@@ -795,7 +811,9 @@ async fn status_handler(
     headers: HeaderMap,
 ) -> Result<Json<StatusResponse>, StatusCode> {
     check_rate_limit(&state, "read", false)?;
-    let _ = &headers;
+    if state.requires_auth_for_reads() {
+        validate_auth(&state, &headers)?;
+    }
     let uptime = Utc::now() - state.daemon_state.start_time;
     let guards = state
         .daemon_state
@@ -823,6 +841,9 @@ async fn events_handler(
     Query(params): Query<EventsQuery>,
 ) -> Result<Json<EventsResponse>, StatusCode> {
     check_rate_limit(&state, "read", false)?;
+    if state.requires_auth_for_reads() {
+        validate_auth(&state, &headers)?;
+    }
     let _ = &headers;
     let limit = params.limit.unwrap_or(0);
     let min_severity = params.severity.as_deref().and_then(parse_severity);
@@ -872,7 +893,9 @@ async fn config_handler(
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
     check_rate_limit(&state, "read", false)?;
-    let _ = &headers;
+    if state.requires_auth_for_reads() {
+        validate_auth(&state, &headers)?;
+    }
     // Serialiser la config puis redact les champs sensibles
     let config = state.daemon_state.config.read().expect("config read lock");
     let mut config_json = serde_json::to_value(&*config).unwrap_or(serde_json::Value::Null);

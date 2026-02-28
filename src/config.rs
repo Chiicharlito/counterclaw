@@ -195,6 +195,10 @@ pub struct DashboardConfig {
     pub enabled: bool,
     pub bind_address: String,
     pub port: u16,
+    /// When true, read endpoints (/health, /status, etc.) require Bearer auth.
+    /// In paranoid mode, this is forced to true regardless of config.
+    #[serde(default)]
+    pub require_auth_for_reads: bool,
 }
 
 // ---------------------------------------------------------------------------
