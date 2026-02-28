@@ -14,6 +14,21 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 // ---------------------------------------------------------------------------
+// Self-protection paths — always blocked regardless of mode or user config
+// ---------------------------------------------------------------------------
+
+/// Paths that CounterClaw uses for its own operation.
+/// These are ALWAYS blocked to prevent an agent from tampering with the daemon.
+/// Matching is hierarchical: any file under these directories is also blocked.
+pub const SELF_PROTECTION_PATHS: &[&str] = &[
+    "/etc/counterclaw/",
+    "/var/log/counterclaw/",
+    "/var/run/counterclaw.pid",
+    "/Library/LaunchDaemons/io.counterclaw.daemon.plist",
+    "/usr/local/bin/counterclaw",
+];
+
+// ---------------------------------------------------------------------------
 // PathVerdict — résultat du matching d'un chemin
 // ---------------------------------------------------------------------------
 
@@ -36,9 +51,11 @@ pub enum PathVerdict {
 
 /// Compare un chemin contre les listes blocked/read_only/allowed.
 ///
-/// Priorité : Blocked > ReadOnly > Allowed > Unmatched.
+/// Priorité : SelfProtection > Blocked > ReadOnly > Allowed > Unmatched.
 ///
 /// Gère :
+/// - Self-protection paths (always blocked, even in Monitor mode)
+/// - Symlink detection and resolution (prevents bypass via symlinks)
 /// - Tilde expansion (~/ → /Users/xxx/)
 /// - Glob patterns (ex: ~/.env.*)
 /// - Canonicalisation (résout ../, //, symlinks)
@@ -96,7 +113,8 @@ impl PathMatcher {
     }
 
     /// Vérifie un chemin contre toutes les règles.
-    /// Retourne le verdict avec la priorité : Blocked > ReadOnly > Allowed > Unmatched.
+    /// Retourne le verdict avec la priorité :
+    /// SelfProtection > Symlink-resolved > Blocked > ReadOnly > Allowed > Unmatched.
     ///
     /// En mode Paranoid, un chemin Unmatched est traité comme Blocked (default:deny).
     pub fn check(&self, path: &Path, mode: &crate::types::OperationMode) -> PathVerdict {
@@ -105,17 +123,55 @@ impl PathMatcher {
             return PathVerdict::Unmatched;
         }
 
-        // Normaliser le chemin : canonicalize si possible, sinon nettoyage basique
-        let normalized = Self::normalize(path);
-
-        // Vérifier dans l'ordre de priorité
-        if self.matches_list(&normalized, &self.blocked, &self.blocked_globs) {
+        // ---------------------------------------------------------------
+        // Step 0.4 — Self-protection: ALWAYS blocked, regardless of mode
+        // ---------------------------------------------------------------
+        let normalized_for_self = Self::normalize(path);
+        if Self::matches_self_protection(&normalized_for_self) {
             return PathVerdict::Blocked;
         }
-        if self.matches_list(&normalized, &self.read_only, &self.read_only_globs) {
+
+        // ---------------------------------------------------------------
+        // Step 1.3 — Symlink detection: resolve symlinks and check the
+        // real target against self-protection paths
+        // ---------------------------------------------------------------
+        if has_symlink_components(path) {
+            if let Some(resolved) = resolve_symlink_target(path) {
+                let resolved_normalized = Self::normalize(&resolved);
+                // Symlink pointing to self-protection → always blocked
+                if Self::matches_self_protection(&resolved_normalized) {
+                    return PathVerdict::Blocked;
+                }
+            }
+        }
+
+        // Normaliser le chemin : canonicalize si possible, sinon nettoyage basique
+        // (canonicalize already follows symlinks on supported platforms)
+        let normalized = Self::normalize(path);
+
+        // Double-check: if the normalized path (after canonicalize which follows
+        // symlinks) hits self-protection → always blocked
+        if Self::matches_self_protection(&normalized) {
+            return PathVerdict::Blocked;
+        }
+
+        self.check_against_rules(&normalized, mode)
+    }
+
+    /// Check a normalized path against user-configured rules (blocked/read_only/allowed).
+    fn check_against_rules(
+        &self,
+        normalized: &Path,
+        mode: &crate::types::OperationMode,
+    ) -> PathVerdict {
+        // Vérifier dans l'ordre de priorité
+        if self.matches_list(normalized, &self.blocked, &self.blocked_globs) {
+            return PathVerdict::Blocked;
+        }
+        if self.matches_list(normalized, &self.read_only, &self.read_only_globs) {
             return PathVerdict::ReadOnly;
         }
-        if self.matches_list(&normalized, &self.allowed, &self.allowed_globs) {
+        if self.matches_list(normalized, &self.allowed, &self.allowed_globs) {
             return PathVerdict::Allowed;
         }
 
@@ -125,6 +181,32 @@ impl PathMatcher {
         }
 
         PathVerdict::Unmatched
+    }
+
+    /// Checks if a normalized path matches any self-protection path.
+    /// Self-protection matching is hierarchical: a file under a protected
+    /// directory is also protected.
+    fn matches_self_protection(normalized: &Path) -> bool {
+        let path_str = normalized.to_string_lossy();
+        for sp in SELF_PROTECTION_PATHS {
+            // For directory paths (ending with /), use hierarchical matching
+            if sp.ends_with('/') {
+                if path_str.starts_with(sp) {
+                    return true;
+                }
+                // Also match the directory itself without trailing slash
+                let without_slash = sp.trim_end_matches('/');
+                if path_str == without_slash {
+                    return true;
+                }
+            } else {
+                // Exact file match
+                if path_str == *sp {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Normalise un chemin : tente la canonicalisation, sinon nettoyage lexical.
@@ -185,6 +267,72 @@ impl PathMatcher {
         }
 
         false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Symlink detection and resolution helpers
+// ---------------------------------------------------------------------------
+
+/// Checks if any component along the path is a symlink.
+/// Walks the path from root downward, checking each prefix.
+pub fn has_symlink_components(path: &Path) -> bool {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component);
+        // Check if this prefix is a symlink
+        if let Ok(metadata) = std::fs::symlink_metadata(&current) {
+            if metadata.file_type().is_symlink() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Resolves a path that may contain symlinks to its final real target.
+/// Returns `None` if the path cannot be resolved (e.g., broken symlink).
+pub fn resolve_symlink_target(path: &Path) -> Option<PathBuf> {
+    // First try direct read_link for simple symlinks
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() {
+            // Use canonicalize to follow the full chain
+            return path.canonicalize().ok();
+        }
+    }
+
+    // For paths with symlink components in the middle, try canonicalize
+    // on the longest existing prefix
+    let mut current = PathBuf::new();
+    let mut remaining_components = Vec::new();
+    let mut found_symlink = false;
+
+    for component in path.components() {
+        current.push(component);
+        if let Ok(metadata) = std::fs::symlink_metadata(&current) {
+            if metadata.file_type().is_symlink() {
+                found_symlink = true;
+                // Resolve this symlink
+                if let Ok(resolved) = current.canonicalize() {
+                    current = resolved;
+                } else {
+                    return None;
+                }
+            }
+        } else {
+            // Path component doesn't exist yet — collect remaining
+            remaining_components.push(component);
+        }
+    }
+
+    if found_symlink {
+        // Append any remaining components to the resolved path
+        for comp in remaining_components {
+            current.push(comp);
+        }
+        Some(current)
+    } else {
+        None
     }
 }
 

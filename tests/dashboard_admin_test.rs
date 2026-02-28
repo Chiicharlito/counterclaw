@@ -14,7 +14,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use counterclaw::config::AppConfig;
 use counterclaw::daemon::DaemonState;
-use counterclaw::dashboard::server::build_router;
+use counterclaw::dashboard::server::{build_router, DashboardState};
 use counterclaw::types::EventBuffer;
 use std::sync::{Arc, RwLock};
 use tower::ServiceExt;
@@ -48,7 +48,7 @@ async fn get_html(app: axum::Router, uri: &str) -> (StatusCode, String) {
 #[tokio::test]
 async fn dashboard_html_contains_tabs() {
     let state = setup_state();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
     let (status, body) = get_html(app, "/").await;
 
     assert_eq!(status, StatusCode::OK);
@@ -67,7 +67,7 @@ async fn dashboard_html_contains_tabs() {
 #[tokio::test]
 async fn dashboard_html_contains_add_forms() {
     let state = setup_state();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
     let (_, body) = get_html(app, "/").await;
 
     // Doit contenir des boutons/formulaires d'ajout
@@ -84,7 +84,7 @@ async fn dashboard_html_contains_add_forms() {
 #[tokio::test]
 async fn dashboard_html_contains_mode_selector() {
     let state = setup_state();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
     let (_, body) = get_html(app, "/").await;
 
     assert!(
@@ -104,7 +104,7 @@ async fn dashboard_html_contains_mode_selector() {
 #[tokio::test]
 async fn dashboard_html_contains_logo() {
     let state = setup_state();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
     let (_, body) = get_html(app, "/").await;
 
     assert!(
@@ -120,7 +120,7 @@ async fn dashboard_html_contains_logo() {
 #[tokio::test]
 async fn dashboard_html_references_rules_api() {
     let state = setup_state();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
     let (_, body) = get_html(app, "/").await;
 
     assert!(
@@ -136,7 +136,7 @@ async fn dashboard_html_references_rules_api() {
 #[tokio::test]
 async fn dashboard_html_xss_safe() {
     let state = setup_state();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
     let (_, body) = get_html(app, "/").await;
 
     // Le JS ne doit JAMAIS utiliser innerHTML avec des données dynamiques
@@ -161,7 +161,7 @@ async fn dashboard_html_xss_safe() {
 #[tokio::test]
 async fn dashboard_html_has_realtime_updates() {
     let state = setup_state();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
     let (_, body) = get_html(app, "/").await;
 
     // Doit avoir soit EventSource (SSE) soit setInterval (polling) pour les mises à jour

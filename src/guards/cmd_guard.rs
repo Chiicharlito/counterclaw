@@ -143,6 +143,21 @@ impl CommandMatcher {
             }
         }
 
+        // Shell evasion detection — block encoding/obfuscation in Enforce/Paranoid modes
+        if let Some(evasion_desc) = self.check_evasion(command) {
+            match mode {
+                crate::types::OperationMode::Enforce | crate::types::OperationMode::Paranoid => {
+                    return Some(CommandVerdict {
+                        match_type: MatchType::Blacklisted,
+                        severity: Severity::High,
+                        description: format!("Shell evasion detected: {}", evasion_desc),
+                        pattern: "shell_evasion".to_string(),
+                    });
+                }
+                crate::types::OperationMode::Monitor => { /* log only, don't block */ }
+            }
+        }
+
         // Default:deny en mode Paranoid — toute commande non-matchée est bloquée
         if *mode == crate::types::OperationMode::Paranoid {
             return Some(CommandVerdict {
@@ -153,6 +168,34 @@ impl CommandMatcher {
             });
         }
 
+        None
+    }
+
+    /// Check if a command uses shell encoding/obfuscation evasion techniques.
+    /// In Paranoid mode, these patterns trigger blocking.
+    ///
+    /// Returns Some(description) if evasion detected, None otherwise.
+    pub fn check_evasion(&self, cmd: &str) -> Option<&'static str> {
+        /// Meta-patterns for detecting shell obfuscation/encoding evasion.
+        const SHELL_EVASION_PATTERNS: &[(&str, &str)] = &[
+            (r"\$\(", "command substitution via $()"),
+            (r"`[^`]+`", "command substitution via backticks"),
+            (r"\\x[0-9a-fA-F]{2}", "hex-encoded characters"),
+            (r"\bprintf\b.*\\x", "printf with hex encoding"),
+            (r"\beval\b", "eval command execution"),
+            (
+                r"\bbase64\b.*(decode|--decode|\s-d\b)",
+                "base64 decode execution",
+            ),
+        ];
+
+        for (pattern, description) in SHELL_EVASION_PATTERNS {
+            if let Ok(re) = Regex::new(pattern) {
+                if re.is_match(cmd) {
+                    return Some(description);
+                }
+            }
+        }
         None
     }
 

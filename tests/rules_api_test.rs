@@ -14,7 +14,7 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use counterclaw::config::AppConfig;
 use counterclaw::daemon::DaemonState;
-use counterclaw::dashboard::server::build_router;
+use counterclaw::dashboard::server::{build_router, DashboardState};
 use counterclaw::types::EventBuffer;
 use std::sync::{Arc, RwLock};
 use tower::ServiceExt;
@@ -60,7 +60,7 @@ async fn request(
 #[tokio::test]
 async fn get_all_rules_returns_all_guards() {
     let (state, _env) = setup_state_with_env();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
     let (status, body) = request(app, Method::GET, "/api/rules", None).await;
 
     assert_eq!(status, StatusCode::OK);
@@ -79,7 +79,7 @@ async fn get_all_rules_returns_all_guards() {
 #[tokio::test]
 async fn get_fs_rules_returns_categories() {
     let (state, _env) = setup_state_with_env();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
     let (status, body) = request(app, Method::GET, "/api/rules/fs", None).await;
 
     assert_eq!(status, StatusCode::OK);
@@ -96,7 +96,7 @@ async fn get_fs_rules_returns_categories() {
 #[tokio::test]
 async fn add_fs_rule_succeeds() {
     let (state, _env) = setup_state_with_env();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
     let (status, _) = request(
         app,
         Method::POST,
@@ -113,7 +113,7 @@ async fn add_fs_rule_appears_in_config() {
     let (state, _env) = setup_state_with_env();
 
     // Ajouter une règle
-    let app = build_router(Arc::clone(&state));
+    let app = build_router(DashboardState::new(Arc::clone(&state)));
     let (status, _) = request(
         app,
         Method::POST,
@@ -137,7 +137,7 @@ async fn add_fs_rule_appears_in_config() {
 #[tokio::test]
 async fn add_domain_rule_succeeds() {
     let (state, _env) = setup_state_with_env();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
     let (status, _) = request(
         app,
         Method::POST,
@@ -152,7 +152,7 @@ async fn add_domain_rule_succeeds() {
 #[tokio::test]
 async fn add_command_rule_succeeds() {
     let (state, _env) = setup_state_with_env();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
     let (status, _) = request(
         app,
         Method::POST,
@@ -167,7 +167,7 @@ async fn add_command_rule_succeeds() {
 #[tokio::test]
 async fn add_egress_rule_succeeds() {
     let (state, _env) = setup_state_with_env();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
     let (status, _) = request(
         app,
         Method::POST,
@@ -188,7 +188,7 @@ async fn delete_fs_rule_succeeds() {
     let (state, _env) = setup_state_with_env();
 
     // D'abord ajouter une règle
-    let app = build_router(Arc::clone(&state));
+    let app = build_router(DashboardState::new(Arc::clone(&state)));
     request(
         app,
         Method::POST,
@@ -207,7 +207,7 @@ async fn delete_fs_rule_succeeds() {
     }
 
     // Supprimer
-    let app = build_router(Arc::clone(&state));
+    let app = build_router(DashboardState::new(Arc::clone(&state)));
     let (status, _) = request(app, Method::DELETE, "/api/rules/fs/blocked/0", None).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -229,7 +229,7 @@ async fn delete_fs_rule_succeeds() {
 #[tokio::test]
 async fn change_mode_succeeds() {
     let (state, _env) = setup_state_with_env();
-    let app = build_router(Arc::clone(&state));
+    let app = build_router(DashboardState::new(Arc::clone(&state)));
 
     assert_eq!(state.mode().to_string(), "monitor");
 
@@ -248,7 +248,7 @@ async fn change_mode_succeeds() {
 #[tokio::test]
 async fn change_mode_invalid_rejected() {
     let (state, _env) = setup_state_with_env();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
 
     let (status, _) = request(
         app,
@@ -268,7 +268,7 @@ async fn change_mode_invalid_rejected() {
 #[tokio::test]
 async fn invalid_regex_rejected() {
     let (state, _env) = setup_state_with_env();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
 
     let (status, _) = request(
         app,
@@ -288,7 +288,7 @@ async fn invalid_regex_rejected() {
 #[tokio::test]
 async fn unknown_guard_returns_404() {
     let (state, _env) = setup_state_with_env();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
 
     let (status, _) = request(app, Method::GET, "/api/rules/unknown", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);

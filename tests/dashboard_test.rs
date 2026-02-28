@@ -6,7 +6,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use counterclaw::config::AppConfig;
 use counterclaw::daemon::DaemonState;
-use counterclaw::dashboard::server::{build_router, parse_duration};
+use counterclaw::dashboard::server::{build_router, parse_duration, DashboardState};
 use counterclaw::types::{ActionTaken, EventBuffer, GuardModule, SecurityEvent, Severity};
 use std::sync::{Arc, RwLock};
 use tower::ServiceExt;
@@ -77,7 +77,7 @@ async fn get(app: axum::Router, uri: &str) -> (StatusCode, String) {
 #[tokio::test]
 async fn health_returns_ok() {
     let state = setup_state();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
     let (status, body) = get(app, "/api/health").await;
 
     assert_eq!(status, StatusCode::OK);
@@ -88,7 +88,7 @@ async fn health_returns_ok() {
 #[tokio::test]
 async fn health_includes_timestamp() {
     let state = setup_state();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
     let (_, body) = get(app, "/api/health").await;
 
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -107,7 +107,7 @@ async fn health_includes_timestamp() {
 #[tokio::test]
 async fn status_returns_mode() {
     let state = setup_state();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
     let (status, body) = get(app, "/api/status").await;
 
     assert_eq!(status, StatusCode::OK);
@@ -118,7 +118,7 @@ async fn status_returns_mode() {
 #[tokio::test]
 async fn status_lists_guards() {
     let state = setup_state();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
     let (_, body) = get(app, "/api/status").await;
 
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -139,7 +139,7 @@ async fn status_lists_guards() {
 #[tokio::test]
 async fn events_returns_events() {
     let state = setup_state_with_events();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
     let (status, body) = get(app, "/api/events").await;
 
     assert_eq!(status, StatusCode::OK);
@@ -151,7 +151,7 @@ async fn events_returns_events() {
 #[tokio::test]
 async fn events_respects_limit() {
     let state = setup_state_with_events();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
     let (_, body) = get(app, "/api/events?limit=1").await;
 
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -162,7 +162,7 @@ async fn events_respects_limit() {
 #[tokio::test]
 async fn events_filters_by_severity() {
     let state = setup_state_with_events();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
     let (_, body) = get(app, "/api/events?severity=critical").await;
 
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -174,7 +174,7 @@ async fn events_filters_by_severity() {
 #[tokio::test]
 async fn events_filters_by_module() {
     let state = setup_state_with_events();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
     let (_, body) = get(app, "/api/events?module=fs_guard").await;
 
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -190,7 +190,7 @@ async fn events_filters_by_module() {
 #[tokio::test]
 async fn config_redacts_slack_webhook() {
     let state = setup_state();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
     let (status, body) = get(app, "/api/config").await;
 
     assert_eq!(status, StatusCode::OK);
@@ -208,7 +208,7 @@ async fn config_redacts_slack_webhook() {
 #[tokio::test]
 async fn config_shows_enabled_status() {
     let state = setup_state();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
     let (_, body) = get(app, "/api/config").await;
 
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -228,7 +228,7 @@ async fn config_shows_enabled_status() {
 #[tokio::test]
 async fn dashboard_root_returns_html() {
     let state = setup_state();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
     let (status, body) = get(app, "/").await;
 
     assert_eq!(status, StatusCode::OK);
@@ -242,7 +242,7 @@ async fn dashboard_root_returns_html() {
 #[tokio::test]
 async fn dashboard_root_contains_api_references() {
     let state = setup_state();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
     let (_, body) = get(app, "/").await;
 
     assert!(
@@ -262,7 +262,7 @@ async fn dashboard_root_contains_api_references() {
 #[tokio::test]
 async fn health_shortcut_works() {
     let state = setup_state();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
     let (status, body) = get(app, "/health").await;
 
     assert_eq!(status, StatusCode::OK);
@@ -273,7 +273,7 @@ async fn health_shortcut_works() {
 #[tokio::test]
 async fn status_shortcut_works() {
     let state = setup_state();
-    let app = build_router(state);
+    let app = build_router(DashboardState::new(state));
     let (status, body) = get(app, "/status").await;
 
     assert_eq!(status, StatusCode::OK);

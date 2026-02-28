@@ -258,10 +258,27 @@ impl EventBuffer {
         }
     }
 
-    /// Ajoute un événement. Évince le plus ancien si le buffer est plein.
+    /// Ajoute un événement avec éviction intelligente basée sur la priorité.
+    ///
+    /// Quand le buffer est plein :
+    /// - Tente toujours d'évincer le plus ancien événement Low/Info d'abord
+    /// - Seulement s'il n'y a pas de Low/Info à évincer :
+    ///   - Les événements Critical/High évincent le plus ancien tout court
+    ///   - Les événements Low/Info sont droppés (ne remplacent pas des événements importants)
     pub fn push(&mut self, event: SecurityEvent) {
         if self.events.len() >= self.max_capacity {
-            self.events.pop_front();
+            // Try to evict the oldest Low/Info event first
+            if let Some(pos) = self.events.iter().position(|e| e.severity < Severity::High) {
+                self.events.remove(pos);
+            } else if event.severity >= Severity::High {
+                // No low-priority events to evict, but new event is high priority
+                // → evict the oldest regardless
+                self.events.pop_front();
+            } else {
+                // No low-priority events to evict and new event is also low priority
+                // → drop the new event to preserve high-priority events
+                return;
+            }
         }
         self.events.push_back(event);
     }

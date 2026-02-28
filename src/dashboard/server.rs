@@ -1,21 +1,222 @@
 //! Dashboard HTTP server — endpoints JSON pour monitorer CounterClaw.
 //!
-//! Serveur axum léger qui expose l'état du daemon via une API REST.
-//! Lit depuis Arc<DaemonState> (lecture seule, pas de mutation).
+//! Serveur axum leger qui expose l'etat du daemon via une API REST.
+//! Securise par :
+//! - Authentification Bearer token sur les endpoints d'ecriture
+//! - Validation d'Origin (CSRF) sur les endpoints mutants
+//! - Rate limiting en memoire (10/s write, 100/s read)
+//! - Validation des entrees (longueur, doublons, regex)
+//! - Headers de securite (CSP, X-Frame-Options, X-Content-Type-Options)
+//! - Auto-protection (chemins critiques non supprimables)
 
+// Input validation constants
+const MAX_RULE_VALUE_LENGTH: usize = 500;
+const MAX_RULES_PER_CATEGORY: usize = 1000;
 use crate::daemon::DaemonState;
 use crate::types::{GuardModule, Severity};
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
-use axum::response::{Html, Json};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{Html, Json, Response};
 use axum::routing::get;
 use axum::Router;
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 
 // ---------------------------------------------------------------------------
-// DTOs — types sérialisables pour les réponses JSON
+// Self-protection — paths that can NEVER be removed via API
+// ---------------------------------------------------------------------------
+
+/// Paths that are ALWAYS protected and cannot be removed via API.
+pub const SELF_PROTECTION_PATHS: &[&str] = &[
+    "/etc/counterclaw/",
+    "/var/log/counterclaw/",
+    "/var/run/counterclaw.pid",
+    "/Library/LaunchDaemons/io.counterclaw.daemon.plist",
+    "/usr/local/bin/counterclaw",
+];
+
+// ---------------------------------------------------------------------------
+// Rate limiter — simple in-memory per-key tracking
+// ---------------------------------------------------------------------------
+
+/// Simple in-memory rate limiter tracking request timestamps per key.
+pub struct RateLimiter {
+    /// Map of client key -> deque of request timestamps.
+    requests: HashMap<String, VecDeque<Instant>>,
+}
+
+impl RateLimiter {
+    /// Create a new empty rate limiter.
+    pub fn new() -> Self {
+        Self {
+            requests: HashMap::new(),
+        }
+    }
+
+    /// Check if a request is allowed under the given rate limit.
+    ///
+    /// Returns true if allowed, false if rate-limited.
+    /// `max_per_second` is the maximum number of requests per second.
+    pub fn check_rate(&mut self, key: &str, max_per_second: u32) -> bool {
+        let now = Instant::now();
+        let window = std::time::Duration::from_secs(1);
+
+        let timestamps = self.requests.entry(key.to_string()).or_default();
+
+        // Remove timestamps older than the window
+        while let Some(front) = timestamps.front() {
+            if now.duration_since(*front) > window {
+                timestamps.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        if timestamps.len() >= max_per_second as usize {
+            return false;
+        }
+
+        timestamps.push_back(now);
+        true
+    }
+}
+
+impl Default for RateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DashboardState — wraps DaemonState + security features
+// ---------------------------------------------------------------------------
+
+/// Dashboard state wrapping the daemon state with security features.
+///
+/// This is the axum state type for the router, providing:
+/// - Access to the underlying DaemonState
+/// - Optional Bearer token authentication
+/// - In-memory rate limiting
+#[derive(Clone)]
+pub struct DashboardState {
+    /// The underlying daemon state (config, guards, event buffer).
+    pub daemon_state: Arc<DaemonState>,
+    /// Optional Bearer token for write endpoint authentication.
+    pub auth_token: Option<String>,
+    /// In-memory rate limiter shared across handlers.
+    pub rate_limiter: Arc<std::sync::Mutex<RateLimiter>>,
+}
+
+impl DashboardState {
+    /// Create a new DashboardState with no auth token.
+    pub fn new(daemon_state: Arc<DaemonState>) -> Self {
+        Self {
+            daemon_state,
+            auth_token: None,
+            rate_limiter: Arc::new(std::sync::Mutex::new(RateLimiter::new())),
+        }
+    }
+
+    /// Create a new DashboardState with a Bearer auth token.
+    pub fn with_token(daemon_state: Arc<DaemonState>, token: String) -> Self {
+        Self {
+            daemon_state,
+            auth_token: Some(token),
+            rate_limiter: Arc::new(std::sync::Mutex::new(RateLimiter::new())),
+        }
+    }
+}
+
+/// Generate a random 64-character hex API token (32 bytes of entropy).
+///
+/// Uses two UUIDv4 values concatenated in simple (no-hyphen) format
+/// to produce a 64-character hex string.
+pub fn generate_api_token() -> String {
+    let id1 = uuid::Uuid::new_v4();
+    let id2 = uuid::Uuid::new_v4();
+    format!("{}{}", id1.as_simple(), id2.as_simple())
+}
+
+// ---------------------------------------------------------------------------
+// Security helpers — auth, CSRF, rate limiting
+// ---------------------------------------------------------------------------
+
+/// Extract a Bearer token from the Authorization header.
+pub fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|t| t.to_string())
+}
+
+/// Validate the Bearer token against the configured auth token.
+///
+/// - If no auth token is configured, all requests are allowed.
+/// - If an auth token is configured, the request must include a matching
+///   `Authorization: Bearer <token>` header.
+pub fn validate_auth(state: &DashboardState, headers: &HeaderMap) -> Result<(), StatusCode> {
+    match &state.auth_token {
+        None => Ok(()), // No auth configured => allow all
+        Some(expected) => {
+            let provided = extract_bearer_token(headers);
+            match provided {
+                Some(ref token) if token == expected => Ok(()),
+                _ => Err(StatusCode::UNAUTHORIZED),
+            }
+        }
+    }
+}
+
+/// Validate the Origin header on mutating requests (CSRF protection).
+///
+/// Accepts:
+/// - Missing Origin header (for curl/API tools)
+/// - localhost, 127.0.0.1, ::1 with any port
+///
+/// Rejects:
+/// - Any other origin with 403 Forbidden
+pub fn validate_origin(headers: &HeaderMap) -> Result<(), StatusCode> {
+    let origin = match headers.get("origin").and_then(|v| v.to_str().ok()) {
+        None => return Ok(()), // No Origin header => allow (curl, API clients)
+        Some(o) => o,
+    };
+
+    // Parse the origin to extract the host
+    // Origin format: scheme://host[:port]
+    let host = origin
+        .split("://")
+        .nth(1)
+        .unwrap_or(origin)
+        .split(':')
+        .next()
+        .unwrap_or("");
+
+    match host {
+        "localhost" | "127.0.0.1" | "::1" | "[::1]" => Ok(()),
+        _ => Err(StatusCode::FORBIDDEN),
+    }
+}
+
+/// Check rate limiting for a request.
+///
+/// - Write endpoints: max 10 requests per second
+/// - Read endpoints: max 100 requests per second
+fn check_rate_limit(state: &DashboardState, key: &str, is_write: bool) -> Result<(), StatusCode> {
+    let max_per_second = if is_write { 10 } else { 100 };
+    let mut limiter = state.rate_limiter.lock().expect("rate limiter lock");
+    if limiter.check_rate(key, max_per_second) {
+        Ok(())
+    } else {
+        Err(StatusCode::TOO_MANY_REQUESTS)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DTOs — types serialisables pour les reponses JSON
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize)]
@@ -68,7 +269,7 @@ pub struct EventsQuery {
 // parse_duration — helper pur
 // ---------------------------------------------------------------------------
 
-/// Parse une durée humaine ("2h", "30m", "60s") en chrono::Duration.
+/// Parse une duree humaine ("2h", "30m", "60s") en chrono::Duration.
 pub fn parse_duration(s: &str) -> Option<Duration> {
     if s.is_empty() {
         return None;
@@ -114,7 +315,7 @@ fn parse_module(s: &str) -> Option<GuardModule> {
 }
 
 // ---------------------------------------------------------------------------
-// Dashboard HTML — page inline, zéro dépendance externe
+// Dashboard HTML — page inline, zero dependance externe
 // ---------------------------------------------------------------------------
 
 const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
@@ -478,7 +679,36 @@ setInterval(function(){refresh();loadRules();},5000);
 </html>"##;
 
 // ---------------------------------------------------------------------------
-// Handlers
+// Security headers middleware
+// ---------------------------------------------------------------------------
+
+/// Adds security headers (CSP, X-Content-Type-Options, X-Frame-Options)
+/// to all responses.
+async fn security_headers_middleware(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        "content-security-policy",
+        "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"
+            .parse()
+            .expect("valid header value"),
+    );
+    headers.insert(
+        "x-content-type-options",
+        "nosniff".parse().expect("valid header value"),
+    );
+    headers.insert(
+        "x-frame-options",
+        "DENY".parse().expect("valid header value"),
+    );
+    response
+}
+
+// ---------------------------------------------------------------------------
+// Handlers — read endpoints (no auth required)
 // ---------------------------------------------------------------------------
 
 /// Sert la page HTML du dashboard.
@@ -486,16 +716,27 @@ async fn dashboard_handler() -> Html<&'static str> {
     Html(DASHBOARD_HTML)
 }
 
-async fn health_handler() -> Json<HealthResponse> {
-    Json(HealthResponse {
+async fn health_handler(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+) -> Result<Json<HealthResponse>, StatusCode> {
+    check_rate_limit(&state, "read", false)?;
+    let _ = &headers; // consumed for rate limit key (future: per-IP)
+    Ok(Json(HealthResponse {
         status: "ok".to_string(),
         timestamp: Utc::now().format("%Y-%m-%dT%H:%M:%S UTC").to_string(),
-    })
+    }))
 }
 
-async fn status_handler(State(state): State<Arc<DaemonState>>) -> Json<StatusResponse> {
-    let uptime = Utc::now() - state.start_time;
+async fn status_handler(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+) -> Result<Json<StatusResponse>, StatusCode> {
+    check_rate_limit(&state, "read", false)?;
+    let _ = &headers;
+    let uptime = Utc::now() - state.daemon_state.start_time;
     let guards = state
+        .daemon_state
         .guard_statuses()
         .into_iter()
         .map(|(name, status)| GuardStatusResponse {
@@ -507,17 +748,20 @@ async fn status_handler(State(state): State<Arc<DaemonState>>) -> Json<StatusRes
         })
         .collect();
 
-    Json(StatusResponse {
+    Ok(Json(StatusResponse {
         daemon_uptime_seconds: uptime.num_seconds(),
-        mode: state.mode().to_string(),
+        mode: state.daemon_state.mode().to_string(),
         guards,
-    })
+    }))
 }
 
 async fn events_handler(
-    State(state): State<Arc<DaemonState>>,
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
     Query(params): Query<EventsQuery>,
-) -> Json<EventsResponse> {
+) -> Result<Json<EventsResponse>, StatusCode> {
+    check_rate_limit(&state, "read", false)?;
+    let _ = &headers;
     let limit = params.limit.unwrap_or(0);
     let min_severity = params.severity.as_deref().and_then(parse_severity);
     let module = params.module.as_deref().and_then(parse_module);
@@ -527,7 +771,7 @@ async fn events_handler(
         .and_then(parse_duration)
         .map(|d| Utc::now() - d);
 
-    let buf = state.event_buffer.read().expect("buffer lock");
+    let buf = state.daemon_state.event_buffer.read().expect("buffer lock");
     let events = buf.query(limit, min_severity.as_ref(), module.as_ref(), since);
 
     let total = events.len();
@@ -555,17 +799,20 @@ async fn events_handler(
         })
         .collect();
 
-    Json(EventsResponse {
+    Ok(Json(EventsResponse {
         events: event_dtos,
         total,
-    })
+    }))
 }
 
 async fn config_handler(
-    State(state): State<Arc<DaemonState>>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    // Sérialiser la config puis redact les champs sensibles
-    let config = state.config.read().expect("config read lock");
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    check_rate_limit(&state, "read", false)?;
+    let _ = &headers;
+    // Serialiser la config puis redact les champs sensibles
+    let config = state.daemon_state.config.read().expect("config read lock");
     let mut config_json = serde_json::to_value(&*config).unwrap_or(serde_json::Value::Null);
     drop(config);
 
@@ -578,14 +825,14 @@ async fn config_handler(
         }
     }
 
-    (StatusCode::OK, Json(config_json))
+    Ok((StatusCode::OK, Json(config_json)))
 }
 
 // ---------------------------------------------------------------------------
-// Rules API — CRUD pour les règles des guards
+// Rules API — CRUD pour les regles des guards
 // ---------------------------------------------------------------------------
 
-/// Requête d'ajout de règle FS/domaine/egress (category + value).
+/// Requete d'ajout de regle FS/domaine/egress (category + value).
 #[derive(Deserialize)]
 struct AddRuleRequest {
     category: String,
@@ -596,16 +843,21 @@ struct AddRuleRequest {
     severity: Option<String>,
 }
 
-/// Requête de changement de mode.
+/// Requete de changement de mode.
 #[derive(Deserialize)]
 struct ChangeModeRequest {
     mode: String,
 }
 
-/// GET /api/rules — liste toutes les règles de tous les guards.
-async fn rules_list_all(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
-    let config = state.config.read().expect("config read lock");
-    Json(serde_json::json!({
+/// GET /api/rules — liste toutes les regles de tous les guards.
+async fn rules_list_all(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    check_rate_limit(&state, "read", false)?;
+    let _ = &headers;
+    let config = state.daemon_state.config.read().expect("config read lock");
+    Ok(Json(serde_json::json!({
         "fs": {
             "blocked": config.fs_guard.blocked_paths,
             "read_only": config.fs_guard.read_only_paths,
@@ -623,15 +875,18 @@ async fn rules_list_all(State(state): State<Arc<DaemonState>>) -> Json<serde_jso
             "blacklist": config.cmd_guard.blacklist,
             "require_approval": config.cmd_guard.require_approval,
         },
-    }))
+    })))
 }
 
-/// GET /api/rules/:guard — règles d'un guard spécifique.
+/// GET /api/rules/:guard — regles d'un guard specifique.
 async fn rules_get_guard(
-    State(state): State<Arc<DaemonState>>,
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
     axum::extract::Path(guard): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let config = state.config.read().expect("config read lock");
+    check_rate_limit(&state, "read", false)?;
+    let _ = &headers;
+    let config = state.daemon_state.config.read().expect("config read lock");
     match guard.as_str() {
         "fs" => Ok(Json(serde_json::json!({
             "blocked": config.fs_guard.blocked_paths,
@@ -654,66 +909,139 @@ async fn rules_get_guard(
     }
 }
 
-/// POST /api/rules/:guard — ajouter une règle.
+// ---------------------------------------------------------------------------
+// Input validation helpers for rules API
+// ---------------------------------------------------------------------------
+
+/// Validate a rule value (length check).
+fn validate_rule_value(value: &str) -> Result<(), (StatusCode, String)> {
+    if value.len() > MAX_RULE_VALUE_LENGTH {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Rule value too long ({} chars, max {})",
+                value.len(),
+                MAX_RULE_VALUE_LENGTH
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate that a category has not exceeded the max rules limit.
+fn validate_category_limit(current_count: usize) -> Result<(), (StatusCode, String)> {
+    if current_count >= MAX_RULES_PER_CATEGORY {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Category limit reached (max {} rules per category)",
+                MAX_RULES_PER_CATEGORY
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Check if a string value already exists in a list (duplicate check).
+fn check_duplicate_string(list: &[String], value: &str) -> Result<(), (StatusCode, String)> {
+    if list.iter().any(|v| v == value) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("Duplicate rule: '{}' already exists", value),
+        ));
+    }
+    Ok(())
+}
+
+/// POST /api/rules/:guard — ajouter une regle.
+///
+/// Requires auth + CSRF validation. Validates:
+/// - Rule value length <= 500 chars
+/// - Category not exceeding 1000 rules
+/// - Regex patterns must compile
+/// - No duplicate rules
 async fn rules_add(
-    State(state): State<Arc<DaemonState>>,
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
     axum::extract::Path(guard): axum::extract::Path<String>,
     Json(body): Json<AddRuleRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let mut config = state.config.write().expect("config write lock");
+    // Security checks: auth, CSRF, rate limit
+    validate_auth(&state, &headers).map_err(|s| (s, "Unauthorized".to_string()))?;
+    validate_origin(&headers).map_err(|s| (s, "Cross-origin request forbidden".to_string()))?;
+    check_rate_limit(&state, "write", true).map_err(|s| (s, "Rate limit exceeded".to_string()))?;
+
+    let mut config = state
+        .daemon_state
+        .config
+        .write()
+        .expect("config write lock");
 
     match guard.as_str() {
         "fs" => {
             let value = body
                 .value
                 .ok_or((StatusCode::BAD_REQUEST, "Missing 'value' field".to_string()))?;
-            match body.category.as_str() {
-                "blocked" => config.fs_guard.blocked_paths.push(value),
-                "read_only" => config.fs_guard.read_only_paths.push(value),
-                "allowed" => config.fs_guard.allowed_paths.push(value),
+            validate_rule_value(&value)?;
+            let list: &mut Vec<String> = match body.category.as_str() {
+                "blocked" => &mut config.fs_guard.blocked_paths,
+                "read_only" => &mut config.fs_guard.read_only_paths,
+                "allowed" => &mut config.fs_guard.allowed_paths,
                 _ => {
                     return Err((
                         StatusCode::BAD_REQUEST,
                         format!("Invalid category '{}' for fs guard", body.category),
                     ))
                 }
-            }
+            };
+            validate_category_limit(list.len())?;
+            check_duplicate_string(list, &value)?;
+            list.push(value);
         }
         "domains" => {
             let value = body
                 .value
                 .ok_or((StatusCode::BAD_REQUEST, "Missing 'value' field".to_string()))?;
-            match body.category.as_str() {
-                "blocked" => config.cdp_proxy.domains.blocked.push(value),
-                "allowed" => config.cdp_proxy.domains.allowed.push(value),
-                "require_approval" => config.cdp_proxy.domains.require_approval.push(value),
+            validate_rule_value(&value)?;
+            let list: &mut Vec<String> = match body.category.as_str() {
+                "blocked" => &mut config.cdp_proxy.domains.blocked,
+                "allowed" => &mut config.cdp_proxy.domains.allowed,
+                "require_approval" => &mut config.cdp_proxy.domains.require_approval,
                 _ => {
                     return Err((
                         StatusCode::BAD_REQUEST,
                         format!("Invalid category '{}' for domains", body.category),
                     ))
                 }
-            }
+            };
+            validate_category_limit(list.len())?;
+            check_duplicate_string(list, &value)?;
+            list.push(value);
         }
         "egress" => {
             let value = body
                 .value
                 .ok_or((StatusCode::BAD_REQUEST, "Missing 'value' field".to_string()))?;
-            match body.category.as_str() {
-                "allowed" => config.net_guard.allowed_egress.push(value),
+            validate_rule_value(&value)?;
+            let list: &mut Vec<String> = match body.category.as_str() {
+                "allowed" => &mut config.net_guard.allowed_egress,
                 _ => {
                     return Err((
                         StatusCode::BAD_REQUEST,
                         format!("Invalid category '{}' for egress", body.category),
                     ))
                 }
-            }
+            };
+            validate_category_limit(list.len())?;
+            check_duplicate_string(list, &value)?;
+            list.push(value);
         }
         "commands" => {
             let pattern = body.pattern.ok_or((
                 StatusCode::BAD_REQUEST,
                 "Missing 'pattern' field".to_string(),
             ))?;
+            validate_rule_value(&pattern)?;
             // Valider la regex
             if regex::Regex::new(&pattern).is_err() {
                 return Err((
@@ -725,6 +1053,19 @@ async fn rules_add(
             match body.category.as_str() {
                 "blacklist" => {
                     let severity = body.severity.unwrap_or_else(|| "warning".to_string());
+                    // Duplicate check for command patterns
+                    if config
+                        .cmd_guard
+                        .blacklist
+                        .iter()
+                        .any(|c| c.pattern == pattern)
+                    {
+                        return Err((
+                            StatusCode::CONFLICT,
+                            format!("Duplicate command pattern: '{}'", pattern),
+                        ));
+                    }
+                    validate_category_limit(config.cmd_guard.blacklist.len())?;
                     config
                         .cmd_guard
                         .blacklist
@@ -735,6 +1076,19 @@ async fn rules_add(
                         });
                 }
                 "require_approval" => {
+                    // Duplicate check for approval patterns
+                    if config
+                        .cmd_guard
+                        .require_approval
+                        .iter()
+                        .any(|c| c.pattern == pattern)
+                    {
+                        return Err((
+                            StatusCode::CONFLICT,
+                            format!("Duplicate approval pattern: '{}'", pattern),
+                        ));
+                    }
+                    validate_category_limit(config.cmd_guard.require_approval.len())?;
                     config
                         .cmd_guard
                         .require_approval
@@ -757,12 +1111,31 @@ async fn rules_add(
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
 
-/// DELETE /api/rules/:guard/:category/:index — supprimer une règle.
+/// Check if a rule value matches a self-protection path.
+fn is_self_protection_path(value: &str) -> bool {
+    SELF_PROTECTION_PATHS
+        .iter()
+        .any(|protected| value == *protected || value.starts_with(protected))
+}
+
+/// DELETE /api/rules/:guard/:category/:index — supprimer une regle.
+///
+/// Requires auth + CSRF validation. Protects self-protection paths.
 async fn rules_delete(
-    State(state): State<Arc<DaemonState>>,
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
     axum::extract::Path((guard, category, index)): axum::extract::Path<(String, String, usize)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let mut config = state.config.write().expect("config write lock");
+    // Security checks: auth, CSRF, rate limit
+    validate_auth(&state, &headers).map_err(|s| (s, "Unauthorized".to_string()))?;
+    validate_origin(&headers).map_err(|s| (s, "Cross-origin request forbidden".to_string()))?;
+    check_rate_limit(&state, "write", true).map_err(|s| (s, "Rate limit exceeded".to_string()))?;
+
+    let mut config = state
+        .daemon_state
+        .config
+        .write()
+        .expect("config write lock");
 
     let list: &mut Vec<String> = match (guard.as_str(), category.as_str()) {
         ("fs", "blocked") => &mut config.fs_guard.blocked_paths,
@@ -787,15 +1160,31 @@ async fn rules_delete(
         ));
     }
 
+    // Self-protection check: cannot remove rules protecting CounterClaw itself
+    if is_self_protection_path(&list[index]) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Cannot remove self-protection rule".to_string(),
+        ));
+    }
+
     list.remove(index);
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
 
-/// PUT /api/mode — changer le mode d'opération.
+/// PUT /api/mode — changer le mode d'operation.
+///
+/// Requires auth + CSRF validation.
 async fn mode_change(
-    State(state): State<Arc<DaemonState>>,
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
     Json(body): Json<ChangeModeRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Security checks: auth, CSRF, rate limit
+    validate_auth(&state, &headers).map_err(|s| (s, "Unauthorized".to_string()))?;
+    validate_origin(&headers).map_err(|s| (s, "Cross-origin request forbidden".to_string()))?;
+    check_rate_limit(&state, "write", true).map_err(|s| (s, "Rate limit exceeded".to_string()))?;
+
     let valid_modes = ["monitor", "enforce", "paranoid"];
     if !valid_modes.contains(&body.mode.as_str()) {
         return Err((
@@ -807,7 +1196,11 @@ async fn mode_change(
         ));
     }
 
-    let mut config = state.config.write().expect("config write lock");
+    let mut config = state
+        .daemon_state
+        .config
+        .write()
+        .expect("config write lock");
     config.general.mode = body.mode.clone();
 
     Ok(Json(serde_json::json!({
@@ -821,7 +1214,9 @@ async fn mode_change(
 // ---------------------------------------------------------------------------
 
 /// Construit le routeur axum avec tous les endpoints du dashboard.
-pub fn build_router(state: Arc<DaemonState>) -> Router {
+///
+/// Accepts `DashboardState` which wraps `Arc<DaemonState>` with security features.
+pub fn build_router(state: DashboardState) -> Router {
     use axum::routing::{delete, put};
 
     Router::new()
@@ -841,5 +1236,6 @@ pub fn build_router(state: Arc<DaemonState>) -> Router {
         )
         // Mode change
         .route("/api/mode", put(mode_change))
+        .layer(axum::middleware::from_fn(security_headers_middleware))
         .with_state(state)
 }
