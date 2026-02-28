@@ -9,6 +9,7 @@
 
 pub mod alerting;
 pub mod config;
+pub mod daemon;
 pub mod dashboard;
 pub mod guards;
 pub mod process;
