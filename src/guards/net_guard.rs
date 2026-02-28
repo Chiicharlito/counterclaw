@@ -5,13 +5,14 @@
 //! 2. **ConnectionParser** (logique pure) : output lsof → Vec<ConnectionInfo>
 //! 3. **NetGuard** (Guard trait) : polling lsof → détection → mpsc
 
-use crate::config::NetGuardConfig;
+use crate::config::{AppConfig, NetGuardConfig};
 use crate::types::{Guard, GuardStatus, SecurityEvent};
 use chrono::{Duration, Utc};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
 // EgressVerdict — résultat du matching d'une connexion sortante
@@ -239,17 +240,25 @@ pub struct NetGuard {
     events_total: Arc<AtomicU64>,
     events_blocked: Arc<AtomicU64>,
     start_time: Arc<std::sync::Mutex<Option<chrono::DateTime<Utc>>>>,
+    cancel_token: CancellationToken,
+    task_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Shared config for hot-reload and mode access (used in start() I/O layer).
+    #[allow(dead_code)]
+    app_config: Arc<RwLock<AppConfig>>,
 }
 
 impl NetGuard {
     /// Crée un nouveau NetGuard à partir de la configuration.
-    pub fn new(config: &NetGuardConfig) -> Self {
+    pub fn new(config: &NetGuardConfig, app_config: Arc<RwLock<AppConfig>>) -> Self {
         Self {
             config: config.clone(),
             running: Arc::new(AtomicBool::new(false)),
             events_total: Arc::new(AtomicU64::new(0)),
             events_blocked: Arc::new(AtomicU64::new(0)),
             start_time: Arc::new(std::sync::Mutex::new(None)),
+            cancel_token: CancellationToken::new(),
+            task_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            app_config,
         }
     }
 }
@@ -260,14 +269,148 @@ impl Guard for NetGuard {
         "net_guard"
     }
 
-    async fn start(&self, _alert_tx: mpsc::Sender<SecurityEvent>) -> anyhow::Result<()> {
+    async fn start(&self, alert_tx: mpsc::Sender<SecurityEvent>) -> anyhow::Result<()> {
         self.running.store(true, Ordering::SeqCst);
         *self.start_time.lock().expect("lock poisoned") = Some(Utc::now());
 
         if self.config.enabled {
-            let _matcher = EgressMatcher::new(&self.config.allowed_egress);
-            let _seen_connections: HashSet<(u32, String, u16)> = HashSet::new();
-            // Le polling lsof serait lancé dans un tokio::task ici
+            let matcher = EgressMatcher::new(&self.config.allowed_egress);
+            let cancel = self.cancel_token.clone();
+            let app_config = Arc::clone(&self.app_config);
+            let watch_processes = self.config.watch_processes.clone();
+            let events_total = Arc::clone(&self.events_total);
+            let events_blocked = Arc::clone(&self.events_blocked);
+
+            let handle = tokio::spawn(async move {
+                let mut seen_connections: HashSet<(u32, String, u16)> = HashSet::new();
+                let mut dns_cache = DnsCache::new();
+
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
+                            tracing::info!("Net Guard polling shutting down");
+                            break;
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {
+                            // Run lsof -i -n -P
+                            let output = match tokio::process::Command::new("lsof")
+                                .args(["-i", "-n", "-P"])
+                                .output()
+                                .await
+                            {
+                                Ok(out) => out,
+                                Err(e) => {
+                                    tracing::warn!("Failed to run lsof: {}", e);
+                                    continue;
+                                }
+                            };
+
+                            let stdout = String::from_utf8_lossy(&output.stdout);
+                            let connections = ConnectionParser::parse_lsof_output(&stdout);
+
+                            // Get current mode
+                            let mode = app_config
+                                .read()
+                                .ok()
+                                .map(|cfg| match cfg.general.mode.as_str() {
+                                    "enforce" => crate::types::OperationMode::Enforce,
+                                    "paranoid" => crate::types::OperationMode::Paranoid,
+                                    _ => crate::types::OperationMode::Monitor,
+                                })
+                                .unwrap_or(crate::types::OperationMode::Monitor);
+
+                            // Filter to watched processes (if list is non-empty)
+                            let filtered: Vec<&ConnectionInfo> = if watch_processes.is_empty() {
+                                connections.iter().collect()
+                            } else {
+                                connections
+                                    .iter()
+                                    .filter(|c| {
+                                        crate::process::matches_process_patterns(
+                                            &c.process_name,
+                                            "",
+                                            &watch_processes,
+                                        )
+                                    })
+                                    .collect()
+                            };
+
+                            // Prune dead connections (clean seen set if > 10000)
+                            if seen_connections.len() > 10_000 {
+                                seen_connections.clear();
+                            }
+
+                            for conn in filtered {
+                                let conn_key = (conn.pid, conn.target_ip.clone(), conn.target_port);
+
+                                // Skip already-seen connections
+                                if seen_connections.contains(&conn_key) {
+                                    continue;
+                                }
+
+                                // Check raw IP alert (paranoid mode only)
+                                if EgressMatcher::is_raw_ip(&conn.target_ip)
+                                    && mode == crate::types::OperationMode::Paranoid
+                                {
+                                    seen_connections.insert(conn_key.clone());
+                                    events_total.fetch_add(1, Ordering::SeqCst);
+                                    events_blocked.fetch_add(1, Ordering::SeqCst);
+                                    let event = SecurityEvent::new(
+                                        crate::types::GuardModule::NetGuard,
+                                        crate::types::Severity::Warning,
+                                        crate::types::ActionTaken::Alerted,
+                                        format!(
+                                            "Raw IP egress detected (pid {} {}): {}:{}",
+                                            conn.pid,
+                                            conn.process_name,
+                                            conn.target_ip,
+                                            conn.target_port
+                                        ),
+                                    );
+                                    let _ = alert_tx.try_send(event);
+                                    continue;
+                                }
+
+                                // DNS rebinding check
+                                if let Some(old_ip) = dns_cache.record(&conn.target_ip, &conn.target_ip) {
+                                    tracing::warn!(
+                                        "DNS rebinding detected: {} changed from {} to {}",
+                                        conn.target_ip,
+                                        old_ip,
+                                        conn.target_ip
+                                    );
+                                }
+
+                                // Check egress against allowed list
+                                let verdict = matcher.check(&conn.target_ip, &mode);
+                                if verdict == EgressVerdict::Blocked {
+                                    seen_connections.insert(conn_key);
+                                    events_total.fetch_add(1, Ordering::SeqCst);
+                                    events_blocked.fetch_add(1, Ordering::SeqCst);
+                                    let event = SecurityEvent::new(
+                                        crate::types::GuardModule::NetGuard,
+                                        crate::types::Severity::Warning,
+                                        crate::types::ActionTaken::Alerted,
+                                        format!(
+                                            "Blocked egress (pid {} {}): {}:{} ({})",
+                                            conn.pid,
+                                            conn.process_name,
+                                            conn.target_ip,
+                                            conn.target_port,
+                                            conn.protocol
+                                        ),
+                                    );
+                                    let _ = alert_tx.try_send(event);
+                                } else {
+                                    seen_connections.insert(conn_key);
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            *self.task_handle.lock().await = Some(handle);
         }
 
         Ok(())
@@ -275,6 +418,10 @@ impl Guard for NetGuard {
 
     async fn stop(&self) -> anyhow::Result<()> {
         self.running.store(false, Ordering::SeqCst);
+        self.cancel_token.cancel();
+        if let Some(handle) = self.task_handle.lock().await.take() {
+            let _ = handle.await;
+        }
         Ok(())
     }
 

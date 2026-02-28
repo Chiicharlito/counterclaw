@@ -131,15 +131,29 @@ pub struct DaemonState {
 impl DaemonState {
     /// Crée un nouvel état de daemon avec les guards instanciés (pas encore démarrés).
     pub fn new(config: AppConfig, event_buffer: Arc<RwLock<EventBuffer>>) -> Self {
+        let config_arc = Arc::new(RwLock::new(config));
+
         let guards: Vec<Arc<dyn Guard>> = vec![
-            Arc::new(FsGuard::new(&config.fs_guard)),
-            Arc::new(CdpProxy::new(&config.cdp_proxy)),
-            Arc::new(NetGuard::new(&config.net_guard)),
-            Arc::new(CmdGuard::new(&config.cmd_guard)),
+            Arc::new(FsGuard::new(
+                &config_arc.read().expect("config read").fs_guard,
+                Arc::clone(&config_arc),
+            )),
+            Arc::new(CdpProxy::new(
+                &config_arc.read().expect("config read").cdp_proxy,
+                Arc::clone(&config_arc),
+            )),
+            Arc::new(NetGuard::new(
+                &config_arc.read().expect("config read").net_guard,
+                Arc::clone(&config_arc),
+            )),
+            Arc::new(CmdGuard::new(
+                &config_arc.read().expect("config read").cmd_guard,
+                Arc::clone(&config_arc),
+            )),
         ];
 
         Self {
-            config: Arc::new(RwLock::new(config)),
+            config: config_arc,
             start_time: Utc::now(),
             event_buffer,
             guards,

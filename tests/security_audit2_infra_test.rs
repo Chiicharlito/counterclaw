@@ -236,7 +236,7 @@ async fn fs_guard_detects_stalled_watcher() {
         },
     };
 
-    let guard = counterclaw::guards::fs_guard::FsGuard::new(&config);
+    let guard = counterclaw::guards::fs_guard::FsGuard::new(&config, common::test_app_config_arc());
     let (tx, _rx) = tokio::sync::mpsc::channel(100);
     guard.start(tx).await.expect("guard should start");
 
@@ -263,7 +263,7 @@ fn fs_guard_watchdog_timeout_configurable() {
         },
     };
 
-    let guard = counterclaw::guards::fs_guard::FsGuard::new(&config);
+    let guard = counterclaw::guards::fs_guard::FsGuard::new(&config, common::test_app_config_arc());
     let status = guard.status();
     assert!(!status.running, "Guard should not be running before start");
 }
