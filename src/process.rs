@@ -70,7 +70,7 @@ pub fn matches_process_patterns(name: &str, cmd: &str, patterns: &[String]) -> b
 /// Retourne true si une divergence est detectee (potentiel spoofing).
 /// Retourne false si les noms correspondent, ou si la commande est vide
 /// ou ne contient pas d'information exploitable.
-#[allow(dead_code)]
+/// V10: Activated — no longer dead_code.
 pub fn check_argv0_mismatch(name: &str, cmd: &str) -> bool {
     // If either is empty, we can't compare
     if name.is_empty() || cmd.is_empty() {

@@ -29,23 +29,29 @@ use std::time::Instant;
 // Self-protection — paths that can NEVER be removed via API
 // ---------------------------------------------------------------------------
 
-/// Paths that are ALWAYS protected and cannot be removed via API.
-pub const SELF_PROTECTION_PATHS: &[&str] = &[
-    "/etc/counterclaw/",
-    "/var/log/counterclaw/",
-    "/var/run/counterclaw.pid",
-    "/Library/LaunchDaemons/io.counterclaw.daemon.plist",
-    "/usr/local/bin/counterclaw",
-];
+/// Returns paths that are ALWAYS protected and cannot be removed via API.
+/// V3: Includes both system-level and user-level (~/.counterclaw/) paths.
+pub fn get_self_protection_paths() -> Vec<String> {
+    crate::guards::fs_guard::get_self_protection_paths()
+}
 
 // ---------------------------------------------------------------------------
 // Rate limiter — simple in-memory per-key tracking
 // ---------------------------------------------------------------------------
 
+/// Maximum number of tracked keys in the rate limiter (V11: prevent DoS).
+const MAX_TRACKED_KEYS: usize = 10_000;
+
+/// TTL for rate limiter entries in seconds (V11: auto-cleanup).
+const RATE_LIMITER_TTL_SECS: u64 = 60;
+
 /// Simple in-memory rate limiter tracking request timestamps per key.
+/// V11: Includes TTL-based cleanup and key cap to prevent memory DoS.
 pub struct RateLimiter {
     /// Map of client key -> deque of request timestamps.
     requests: HashMap<String, VecDeque<Instant>>,
+    /// Counter for periodic cleanup scheduling.
+    check_counter: u64,
 }
 
 impl RateLimiter {
@@ -53,6 +59,7 @@ impl RateLimiter {
     pub fn new() -> Self {
         Self {
             requests: HashMap::new(),
+            check_counter: 0,
         }
     }
 
@@ -60,9 +67,25 @@ impl RateLimiter {
     ///
     /// Returns true if allowed, false if rate-limited.
     /// `max_per_second` is the maximum number of requests per second.
+    /// V11: Periodically cleans expired entries and enforces key cap.
     pub fn check_rate(&mut self, key: &str, max_per_second: u32) -> bool {
         let now = Instant::now();
         let window = std::time::Duration::from_secs(1);
+
+        // V11: Periodic cleanup every 100 requests
+        self.check_counter += 1;
+        if self.check_counter.is_multiple_of(100) {
+            self.cleanup_expired();
+        }
+
+        // V11: Enforce key cap — reject if too many keys tracked
+        if !self.requests.contains_key(key) && self.requests.len() >= MAX_TRACKED_KEYS {
+            self.cleanup_expired();
+            // If still at cap after cleanup, evict oldest entries
+            if self.requests.len() >= MAX_TRACKED_KEYS {
+                self.evict_oldest();
+            }
+        }
 
         let timestamps = self.requests.entry(key.to_string()).or_default();
 
@@ -81,6 +104,45 @@ impl RateLimiter {
 
         timestamps.push_back(now);
         true
+    }
+
+    /// V11: Returns the number of tracked keys (for monitoring/testing).
+    pub fn tracked_keys_count(&self) -> usize {
+        self.requests.len()
+    }
+
+    /// V11: Remove entries that have no activity within the TTL window.
+    pub fn cleanup_expired(&mut self) {
+        let now = Instant::now();
+        let ttl = std::time::Duration::from_secs(RATE_LIMITER_TTL_SECS);
+
+        self.requests.retain(|_, timestamps| {
+            // Keep entries that have at least one timestamp within TTL
+            timestamps
+                .back()
+                .map(|last| now.duration_since(*last) < ttl)
+                .unwrap_or(false)
+        });
+    }
+
+    /// V11: Evict the oldest entries when at key cap.
+    fn evict_oldest(&mut self) {
+        // Remove entries with the oldest last-access time
+        let target = MAX_TRACKED_KEYS * 9 / 10; // Evict down to 90% capacity
+        while self.requests.len() > target {
+            // Find key with oldest last timestamp
+            let oldest_key = self
+                .requests
+                .iter()
+                .min_by_key(|(_, ts)| ts.back().copied())
+                .map(|(k, _)| k.clone());
+
+            if let Some(key) = oldest_key {
+                self.requests.remove(&key);
+            } else {
+                break;
+            }
+        }
     }
 }
 
@@ -953,6 +1015,53 @@ fn check_duplicate_string(list: &[String], value: &str) -> Result<(), (StatusCod
     Ok(())
 }
 
+/// V7: Validate a domain name format.
+///
+/// Rejects domains that:
+/// - Contain whitespace
+/// - Are empty
+/// - Don't look like a valid domain (no dots, unless wildcard)
+fn validate_domain_format(value: &str) -> Result<(), (StatusCode, String)> {
+    if value.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Domain cannot be empty".to_string(),
+        ));
+    }
+    if value.chars().any(|c| c.is_whitespace()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Domain '{}' contains whitespace", value),
+        ));
+    }
+    // Allow wildcards (*.example.com) and simple domains
+    let cleaned = value.replace('*', "x");
+    if !cleaned.contains('.') && cleaned != "localhost" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Domain '{}' appears invalid (no dots)", value),
+        ));
+    }
+    Ok(())
+}
+
+/// V7: Validate a filesystem path format.
+///
+/// Rejects paths that are not absolute and don't start with ~.
+fn validate_path_format(value: &str) -> Result<(), (StatusCode, String)> {
+    if value.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Path cannot be empty".to_string()));
+    }
+    // Allow absolute paths, ~ paths, and glob patterns starting with / or ~
+    if !value.starts_with('/') && !value.starts_with('~') {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Path '{}' must be absolute (start with / or ~)", value),
+        ));
+    }
+    Ok(())
+}
+
 /// POST /api/rules/:guard — ajouter une regle.
 ///
 /// Requires auth + CSRF validation. Validates:
@@ -983,6 +1092,8 @@ async fn rules_add(
                 .value
                 .ok_or((StatusCode::BAD_REQUEST, "Missing 'value' field".to_string()))?;
             validate_rule_value(&value)?;
+            // V7: Validate path format
+            validate_path_format(&value)?;
             let list: &mut Vec<String> = match body.category.as_str() {
                 "blocked" => &mut config.fs_guard.blocked_paths,
                 "read_only" => &mut config.fs_guard.read_only_paths,
@@ -1003,6 +1114,8 @@ async fn rules_add(
                 .value
                 .ok_or((StatusCode::BAD_REQUEST, "Missing 'value' field".to_string()))?;
             validate_rule_value(&value)?;
+            // V7: Validate domain format
+            validate_domain_format(&value)?;
             let list: &mut Vec<String> = match body.category.as_str() {
                 "blocked" => &mut config.cdp_proxy.domains.blocked,
                 "allowed" => &mut config.cdp_proxy.domains.allowed,
@@ -1113,9 +1226,10 @@ async fn rules_add(
 
 /// Check if a rule value matches a self-protection path.
 fn is_self_protection_path(value: &str) -> bool {
-    SELF_PROTECTION_PATHS
+    let protection_paths = get_self_protection_paths();
+    protection_paths
         .iter()
-        .any(|protected| value == *protected || value.starts_with(protected))
+        .any(|protected| value == protected.as_str() || value.starts_with(protected.as_str()))
 }
 
 /// DELETE /api/rules/:guard/:category/:index — supprimer une regle.

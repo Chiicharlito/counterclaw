@@ -53,11 +53,14 @@ fn rejects_oversized_config_file() {
 
 #[test]
 fn slack_webhook_url_prefers_env_variable() {
+    // V8: Environment variable is now IGNORED for security.
+    // An agent could set env vars to redirect notifications to an attacker URL.
+    // The webhook URL is only read from the config file (protected by SELF_PROTECTION_PATHS).
     let env = common::TestEnv::new();
     env.write_default_config();
     let config = AppConfig::load(&env.config_path()).unwrap();
 
-    // Set env variable
+    // Set env variable — should be IGNORED
     std::env::set_var(
         "COUNTERCLAW_SLACK_WEBHOOK",
         "https://hooks.slack.com/test-from-env",
@@ -65,7 +68,8 @@ fn slack_webhook_url_prefers_env_variable() {
     let url = config.slack_webhook_url();
     std::env::remove_var("COUNTERCLAW_SLACK_WEBHOOK");
 
-    assert_eq!(url, "https://hooks.slack.com/test-from-env");
+    // V8: Should return config value, not env var
+    assert_eq!(url, config.alerting.slack.webhook_url);
 }
 
 #[test]

@@ -377,10 +377,14 @@ impl AppConfig {
         expand_tilde(&self.alerting.file_log.path)
     }
 
-    /// Returns the Slack webhook URL, preferring the environment variable.
+    /// Returns the Slack webhook URL from the config file only.
+    ///
+    /// V8: The environment variable COUNTERCLAW_SLACK_WEBHOOK is no longer read.
+    /// An agent could set env vars to redirect notifications to an attacker URL.
+    /// The webhook URL is now only read from the config file, which is protected
+    /// by SELF_PROTECTION_PATHS.
     pub fn slack_webhook_url(&self) -> String {
-        std::env::var("COUNTERCLAW_SLACK_WEBHOOK")
-            .unwrap_or_else(|_| self.alerting.slack.webhook_url.clone())
+        self.alerting.slack.webhook_url.clone()
     }
 
     /// Sauvegarde la configuration dans un fichier YAML.
