@@ -9,14 +9,15 @@
 //! 6. **CdpProxy** (ASYNC) : HTTP discovery + WebSocket relay + Guard trait
 
 use crate::config::{
-    CdpCommandsConfig, CdpProxyConfig, ContentInspectionConfig, DomainRulesConfig,
+    AppConfig, CdpCommandsConfig, CdpProxyConfig, ContentInspectionConfig, DomainRulesConfig,
 };
 use crate::types::{ActionTaken, Guard, GuardModule, GuardStatus, SecurityEvent, Severity};
 use chrono::{Duration, Utc};
 use regex::Regex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -815,11 +816,16 @@ pub struct CdpProxy {
     command_filter: CommandFilter,
     content_inspector: ContentInspector,
     session: Arc<Mutex<CdpSessionState>>,
+    cancel_token: CancellationToken,
+    task_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Shared config for hot-reload and mode access (used in start() I/O layer).
+    #[allow(dead_code)]
+    app_config: Arc<RwLock<AppConfig>>,
 }
 
 impl CdpProxy {
     /// Crée un nouveau CdpProxy depuis la configuration.
-    pub fn new(config: &CdpProxyConfig) -> Self {
+    pub fn new(config: &CdpProxyConfig, app_config: Arc<RwLock<AppConfig>>) -> Self {
         Self {
             config: config.clone(),
             running: Arc::new(AtomicBool::new(false)),
@@ -830,6 +836,9 @@ impl CdpProxy {
             command_filter: CommandFilter::new(&config.cdp_commands),
             content_inspector: ContentInspector::new(&config.content_inspection),
             session: Arc::new(Mutex::new(CdpSessionState::new())),
+            cancel_token: CancellationToken::new(),
+            task_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            app_config,
         }
     }
 
@@ -900,26 +909,374 @@ impl CdpProxy {
     }
 }
 
+// ---------------------------------------------------------------------------
+// HTTP Discovery Router — forwards /json/* to upstream Chrome and rewrites URLs
+// ---------------------------------------------------------------------------
+
+/// Shared state for CDP proxy HTTP + WS handlers.
+#[derive(Clone)]
+struct CdpDiscoveryState {
+    upstream_port: u16,
+    listen_port: u16,
+    bind_address: String,
+    alert_tx: mpsc::Sender<SecurityEvent>,
+    app_config: Arc<RwLock<crate::config::AppConfig>>,
+    /// Per-session state for CDP message inspection.
+    /// Shared across all WS connections (MVP: single session).
+    session: Arc<Mutex<CdpSessionState>>,
+    /// CDP components for message processing.
+    domain_matcher: Arc<DomainMatcher>,
+    command_filter: Arc<CommandFilter>,
+    content_inspector: Arc<ContentInspector>,
+    events_total: Arc<AtomicU64>,
+    events_blocked: Arc<AtomicU64>,
+}
+
+/// Builds the axum router for CDP discovery + WebSocket relay.
+fn build_cdp_discovery_router(state: CdpDiscoveryState) -> axum::Router {
+    axum::Router::new()
+        .route("/json/version", axum::routing::get(handle_cdp_discovery))
+        .route("/json/list", axum::routing::get(handle_cdp_discovery))
+        .route("/json", axum::routing::get(handle_cdp_discovery))
+        .route(
+            "/devtools/browser/{id}",
+            axum::routing::get(handle_ws_upgrade),
+        )
+        .route("/devtools/page/{id}", axum::routing::get(handle_ws_upgrade))
+        .with_state(state)
+}
+
+/// Handler for CDP discovery endpoints — fetches from upstream Chrome and rewrites URLs.
+async fn handle_cdp_discovery(
+    axum::extract::State(state): axum::extract::State<CdpDiscoveryState>,
+    request: axum::extract::Request,
+) -> axum::response::Response {
+    let path = request.uri().path().to_string();
+    let upstream_url = format!("http://127.0.0.1:{}{}", state.upstream_port, path);
+
+    match reqwest::get(&upstream_url).await {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                match resp.text().await {
+                    Ok(body) => {
+                        let rewritten = CdpProxy::rewrite_discovery_response(
+                            &body,
+                            &state.bind_address,
+                            state.listen_port,
+                        );
+                        axum::response::Response::builder()
+                            .status(200)
+                            .header("Content-Type", "application/json")
+                            .body(axum::body::Body::from(rewritten))
+                            .unwrap_or_else(|_| {
+                                axum::response::Response::builder()
+                                    .status(500)
+                                    .body(axum::body::Body::from("Internal error"))
+                                    .expect("valid response")
+                            })
+                    }
+                    Err(e) => axum::response::Response::builder()
+                        .status(502)
+                        .body(axum::body::Body::from(format!(
+                            "Failed to read upstream response: {}",
+                            e
+                        )))
+                        .expect("valid response"),
+                }
+            } else {
+                axum::response::Response::builder()
+                    .status(resp.status().as_u16())
+                    .body(axum::body::Body::from(
+                        resp.text().await.unwrap_or_default(),
+                    ))
+                    .expect("valid response")
+            }
+        }
+        Err(e) => axum::response::Response::builder()
+            .status(502)
+            .body(axum::body::Body::from(format!(
+                "Failed to connect to Chrome upstream: {}",
+                e
+            )))
+            .expect("valid response"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket Relay — bidirectional proxy between client and Chrome
+// ---------------------------------------------------------------------------
+
+/// Handler for WebSocket upgrade on /devtools/browser/{id} and /devtools/page/{id}.
+///
+/// 1. Accepts the WS upgrade from the client (AI agent)
+/// 2. Opens a WS connection to upstream Chrome
+/// 3. Runs a bidirectional relay with CDP message inspection:
+///    - Client → Chrome: inspect via process_cdp_message, block or forward
+///    - Chrome → Client: passthrough (no inspection)
+async fn handle_ws_upgrade(
+    axum::extract::State(state): axum::extract::State<CdpDiscoveryState>,
+    ws: axum::extract::ws::WebSocketUpgrade,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    request: axum::extract::Request,
+) -> axum::response::Response {
+    let path = request.uri().path().to_string();
+    ws.on_upgrade(move |client_socket| ws_relay(client_socket, state, path, id))
+}
+
+/// Bidirectional WebSocket relay between client and upstream Chrome.
+///
+/// For each message from the client:
+/// - Text messages are inspected via process_cdp_message()
+///   - Forward/ForwardAndLog → relay to Chrome
+///   - Block → send synthetic error to client, do NOT relay
+/// - Binary messages are forwarded without inspection
+///
+/// For each message from Chrome:
+/// - All messages are relayed to client (passthrough)
+async fn ws_relay(
+    client_socket: axum::extract::ws::WebSocket,
+    state: CdpDiscoveryState,
+    path: String,
+    _id: String,
+) {
+    use axum::extract::ws::Message as AxumMsg;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as TungMsg;
+
+    // Connect to upstream Chrome
+    let upstream_url = format!("ws://127.0.0.1:{}{}", state.upstream_port, path);
+    let chrome_conn = match tokio_tungstenite::connect_async(&upstream_url).await {
+        Ok((ws, _)) => ws,
+        Err(e) => {
+            tracing::error!("Failed to connect to upstream Chrome WS: {}", e);
+            return;
+        }
+    };
+
+    // Split both connections into read/write halves
+    let (client_tx, mut client_rx) = client_socket.split();
+    let (mut chrome_tx, mut chrome_rx) = chrome_conn.split();
+
+    // Wrap client_tx in Arc<Mutex> so both directions can send to client
+    let client_tx = Arc::new(tokio::sync::Mutex::new(client_tx));
+
+    // Shared state for the relay
+    let alert_tx = state.alert_tx.clone();
+    let app_config = state.app_config.clone();
+    let session = state.session.clone();
+    let domain_matcher = state.domain_matcher.clone();
+    let command_filter = state.command_filter.clone();
+    let content_inspector = state.content_inspector.clone();
+    let events_total = state.events_total.clone();
+    let events_blocked = state.events_blocked.clone();
+
+    // Client → Chrome direction (with CDP inspection)
+    let client_to_chrome = async {
+        while let Some(msg_result) = client_rx.next().await {
+            let msg = match msg_result {
+                Ok(m) => m,
+                Err(_) => break, // Client disconnected
+            };
+
+            match msg {
+                AxumMsg::Text(text) => {
+                    let raw = text.to_string();
+
+                    // Get current mode from shared config (string → OperationMode)
+                    let mode = app_config
+                        .read()
+                        .ok()
+                        .map(|cfg| match cfg.general.mode.as_str() {
+                            "enforce" => crate::types::OperationMode::Enforce,
+                            "paranoid" => crate::types::OperationMode::Paranoid,
+                            _ => crate::types::OperationMode::Monitor,
+                        })
+                        .unwrap_or(crate::types::OperationMode::Monitor);
+
+                    // Inspect the CDP message
+                    let decision = {
+                        let mut session_guard = match session.lock() {
+                            Ok(g) => g,
+                            Err(poisoned) => {
+                                tracing::error!("CDP session mutex poisoned — recovering");
+                                let mut recovered = poisoned.into_inner();
+                                *recovered = CdpSessionState::new();
+                                recovered
+                            }
+                        };
+                        process_cdp_message(
+                            &raw,
+                            &domain_matcher,
+                            &command_filter,
+                            &content_inspector,
+                            &mut session_guard,
+                            &mode,
+                        )
+                    };
+
+                    events_total.fetch_add(1, Ordering::SeqCst);
+
+                    match decision {
+                        CdpDecision::Forward | CdpDecision::ForwardAndLog { .. } => {
+                            // Relay to Chrome
+                            if chrome_tx.send(TungMsg::Text(raw)).await.is_err() {
+                                break; // Chrome disconnected
+                            }
+                        }
+                        CdpDecision::Block {
+                            id,
+                            ref reason,
+                            ref severity,
+                        } => {
+                            events_blocked.fetch_add(1, Ordering::SeqCst);
+
+                            // Emit SecurityEvent
+                            let event = SecurityEvent::new(
+                                GuardModule::CdpProxy,
+                                severity.clone(),
+                                ActionTaken::Blocked,
+                                reason.clone(),
+                            );
+                            let _ = alert_tx.try_send(event);
+
+                            // Send synthetic error to client
+                            let error_msg = generate_synthetic_error(id, reason);
+                            if client_tx
+                                .lock()
+                                .await
+                                .send(AxumMsg::Text(error_msg.into()))
+                                .await
+                                .is_err()
+                            {
+                                break; // Client disconnected
+                            }
+                        }
+                    }
+                }
+                AxumMsg::Binary(data) => {
+                    // Binary messages: relay without inspection
+                    if chrome_tx
+                        .send(TungMsg::Binary(data.to_vec()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                AxumMsg::Close(_) => break,
+                _ => {} // Ping/Pong handled by framework
+            }
+        }
+    };
+
+    // Chrome → Client direction (passthrough)
+    let client_tx_clone = Arc::clone(&client_tx);
+    let chrome_to_client = async move {
+        while let Some(msg_result) = chrome_rx.next().await {
+            let msg = match msg_result {
+                Ok(m) => m,
+                Err(_) => break, // Chrome disconnected
+            };
+
+            match msg {
+                TungMsg::Text(text) => {
+                    if client_tx_clone
+                        .lock()
+                        .await
+                        .send(AxumMsg::Text(text.into()))
+                        .await
+                        .is_err()
+                    {
+                        break; // Client disconnected
+                    }
+                }
+                TungMsg::Binary(data) => {
+                    if client_tx_clone
+                        .lock()
+                        .await
+                        .send(AxumMsg::Binary(data.into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                TungMsg::Close(_) => {
+                    let _ = client_tx_clone
+                        .lock()
+                        .await
+                        .send(AxumMsg::Close(None))
+                        .await;
+                    break;
+                }
+                _ => {} // Ping/Pong handled by tungstenite
+            }
+        }
+    };
+
+    // Run both directions concurrently — when either ends, the other stops
+    tokio::select! {
+        _ = client_to_chrome => {
+            tracing::debug!("CDP WS relay: client side ended");
+        }
+        _ = chrome_to_client => {
+            tracing::debug!("CDP WS relay: Chrome side ended");
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl Guard for CdpProxy {
     fn name(&self) -> &str {
         "cdp_proxy"
     }
 
-    async fn start(&self, _alert_tx: mpsc::Sender<SecurityEvent>) -> anyhow::Result<()> {
+    async fn start(&self, alert_tx: mpsc::Sender<SecurityEvent>) -> anyhow::Result<()> {
         self.running.store(true, Ordering::SeqCst);
         *self.start_time.lock().expect("lock poisoned") = Some(Utc::now());
 
-        // Phase 2 MVP : le serveur HTTP + WebSocket serait lancé ici.
-        // Pour les tests, on valide le lifecycle et le handle_client_message.
-
         if self.config.enabled {
+            let bind_addr = format!("{}:{}", self.config.bind_address, self.config.listen_port);
+            let cancel = self.cancel_token.clone();
+
+            let state = CdpDiscoveryState {
+                upstream_port: self.config.upstream_port,
+                listen_port: self.config.listen_port,
+                bind_address: self.config.bind_address.clone(),
+                alert_tx,
+                app_config: Arc::clone(&self.app_config),
+                session: Arc::clone(&self.session),
+                domain_matcher: Arc::new(DomainMatcher::new(&self.config.domains)),
+                command_filter: Arc::new(CommandFilter::new(&self.config.cdp_commands)),
+                content_inspector: Arc::new(ContentInspector::new(&self.config.content_inspection)),
+                events_total: Arc::clone(&self.events_total),
+                events_blocked: Arc::clone(&self.events_blocked),
+            };
+
+            let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+
             tracing::info!(
-                "CDP Proxy listening on {}:{} → upstream :{}",
-                self.config.bind_address,
-                self.config.listen_port,
-                self.config.upstream_port
+                "CDP Proxy listening on {} → upstream :{}",
+                bind_addr,
+                state.upstream_port
             );
+
+            let handle = tokio::spawn(async move {
+                let app = build_cdp_discovery_router(state);
+
+                tokio::select! {
+                    result = axum::serve(listener, app) => {
+                        if let Err(e) = result {
+                            tracing::error!("CDP Proxy server error: {}", e);
+                        }
+                    }
+                    _ = cancel.cancelled() => {
+                        tracing::info!("CDP Proxy shutting down");
+                    }
+                }
+            });
+
+            *self.task_handle.lock().await = Some(handle);
         }
 
         Ok(())
@@ -927,6 +1284,10 @@ impl Guard for CdpProxy {
 
     async fn stop(&self) -> anyhow::Result<()> {
         self.running.store(false, Ordering::SeqCst);
+        self.cancel_token.cancel();
+        if let Some(handle) = self.task_handle.lock().await.take() {
+            let _ = handle.await;
+        }
         Ok(())
     }
 

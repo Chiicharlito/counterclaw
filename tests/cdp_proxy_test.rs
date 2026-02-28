@@ -768,7 +768,7 @@ fn http_discovery_rewrites_websocket_url() {
 #[tokio::test]
 async fn websocket_forwards_allowed_message() {
     let config = test_cdp_config();
-    let proxy = CdpProxy::new(&config);
+    let proxy = CdpProxy::new(&config, common::test_app_config_arc());
     let (tx, _rx) = mpsc::channel(16);
 
     let msg = r#"{"id":1,"method":"Page.enable"}"#;
@@ -780,7 +780,7 @@ async fn websocket_forwards_allowed_message() {
 #[tokio::test]
 async fn websocket_blocks_forbidden_message() {
     let config = test_cdp_config();
-    let proxy = CdpProxy::new(&config);
+    let proxy = CdpProxy::new(&config, common::test_app_config_arc());
     let (tx, _rx) = mpsc::channel(16);
 
     let msg = r#"{"id":2,"method":"Network.getCookies"}"#;
@@ -792,7 +792,7 @@ async fn websocket_blocks_forbidden_message() {
 #[tokio::test]
 async fn guard_reports_running_after_start() {
     let config = test_cdp_config();
-    let proxy = CdpProxy::new(&config);
+    let proxy = CdpProxy::new(&config, common::test_app_config_arc());
     let (tx, _rx) = mpsc::channel(16);
 
     proxy.start(tx).await.expect("start failed");
@@ -805,7 +805,7 @@ async fn guard_reports_running_after_start() {
 #[tokio::test]
 async fn guard_reports_stopped_after_stop() {
     let config = test_cdp_config();
-    let proxy = CdpProxy::new(&config);
+    let proxy = CdpProxy::new(&config, common::test_app_config_arc());
     let (tx, _rx) = mpsc::channel(16);
 
     proxy.start(tx).await.expect("start failed");
@@ -818,7 +818,7 @@ async fn guard_reports_stopped_after_stop() {
 #[tokio::test]
 async fn emits_security_event_on_block() {
     let config = test_cdp_config();
-    let proxy = CdpProxy::new(&config);
+    let proxy = CdpProxy::new(&config, common::test_app_config_arc());
     let (tx, mut rx) = mpsc::channel(16);
 
     let msg = r#"{"id":3,"method":"Network.getCookies"}"#;

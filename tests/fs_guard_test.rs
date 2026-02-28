@@ -265,7 +265,8 @@ async fn guard_reports_running_status() {
     let app_config =
         counterclaw::config::AppConfig::load(&env.config_path()).expect("Failed to load config");
 
-    let guard = FsGuard::new(&app_config.fs_guard);
+    let config_arc = std::sync::Arc::new(std::sync::RwLock::new(app_config));
+    let guard = FsGuard::new(&config_arc.read().unwrap().fs_guard, config_arc.clone());
     let (tx, _rx) = mpsc::channel(16);
     guard.start(tx).await.expect("start failed");
 
@@ -284,7 +285,8 @@ async fn guard_reports_stopped_status() {
     let app_config =
         counterclaw::config::AppConfig::load(&env.config_path()).expect("Failed to load config");
 
-    let guard = FsGuard::new(&app_config.fs_guard);
+    let config_arc = std::sync::Arc::new(std::sync::RwLock::new(app_config));
+    let guard = FsGuard::new(&config_arc.read().unwrap().fs_guard, config_arc.clone());
     let (tx, _rx) = mpsc::channel(16);
     guard.start(tx).await.expect("start failed");
     guard.stop().await.expect("stop failed");

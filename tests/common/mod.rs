@@ -8,6 +8,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
@@ -192,6 +193,23 @@ dashboard:
 pub fn find_free_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind to port 0");
     listener.local_addr().unwrap().port()
+}
+
+/// Creates a default Arc<RwLock<AppConfig>> for tests.
+/// Parses the minimal monitor config template into an AppConfig.
+pub fn default_app_config_arc(env: &TestEnv) -> Arc<RwLock<counterclaw::config::AppConfig>> {
+    let yaml = minimal_monitor_config(env);
+    let config: counterclaw::config::AppConfig =
+        serde_yaml::from_str(&yaml).expect("Failed to parse test config");
+    Arc::new(RwLock::new(config))
+}
+
+/// Creates a standalone Arc<RwLock<AppConfig>> without needing a TestEnv.
+/// Uses in-memory paths that don't need to exist on disk.
+pub fn test_app_config_arc() -> Arc<RwLock<counterclaw::config::AppConfig>> {
+    let env = TestEnv::new();
+    default_app_config_arc(&env)
+    // Note: env (TempDir) is dropped here but the Arc<RwLock<AppConfig>> is self-contained
 }
 
 /// Config avec des valeurs invalides — pour tester la validation.

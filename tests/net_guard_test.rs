@@ -267,7 +267,7 @@ fn extracts_pid_and_process_name() {
 #[tokio::test]
 async fn guard_starts_and_stops() {
     let config = config_empty_allowed();
-    let guard = NetGuard::new(&config);
+    let guard = NetGuard::new(&config, common::test_app_config_arc());
 
     let (tx, _rx) = tokio::sync::mpsc::channel(10);
 
@@ -283,14 +283,14 @@ async fn guard_starts_and_stops() {
 #[test]
 fn guard_reports_correct_name() {
     let config = config_empty_allowed();
-    let guard = NetGuard::new(&config);
+    let guard = NetGuard::new(&config, common::test_app_config_arc());
     assert_eq!(guard.name(), "net_guard");
 }
 
 #[test]
 fn guard_status_initial_values() {
     let config = config_empty_allowed();
-    let guard = NetGuard::new(&config);
+    let guard = NetGuard::new(&config, common::test_app_config_arc());
     let status = guard.status();
     assert!(!status.running);
     assert_eq!(status.events_total, 0);
