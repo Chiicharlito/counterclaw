@@ -8,7 +8,7 @@
 use crate::config::NetGuardConfig;
 use crate::types::{Guard, GuardStatus, SecurityEvent};
 use chrono::{Duration, Utc};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -73,6 +73,56 @@ impl EgressMatcher {
         } else {
             EgressVerdict::Allowed
         }
+    }
+
+    /// Check if a destination is a raw IP (not a domain name).
+    /// In Paranoid mode, raw IP egress that's not in the whitelist triggers an alert.
+    pub fn is_raw_ip(destination: &str) -> bool {
+        destination.parse::<std::net::IpAddr>().is_ok()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DnsCache — détection de DNS rebinding
+// ---------------------------------------------------------------------------
+
+/// DNS cache for rebinding detection.
+/// Tracks domain→IP mappings to detect when a domain suddenly resolves
+/// to a different IP, which could indicate a DNS rebinding attack.
+pub struct DnsCache {
+    /// domain (lowercase) -> first-seen IP
+    entries: HashMap<String, String>,
+}
+
+impl DnsCache {
+    /// Crée un nouveau cache DNS vide.
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Record a DNS resolution. Returns None if first seen or same IP,
+    /// or Some(old_ip) if the IP changed (potential rebinding).
+    pub fn record(&mut self, domain: &str, ip: &str) -> Option<String> {
+        let domain_lower = domain.to_lowercase();
+        if let Some(existing_ip) = self.entries.get(&domain_lower) {
+            if existing_ip != ip {
+                let old = existing_ip.clone();
+                self.entries.insert(domain_lower, ip.to_string());
+                return Some(old);
+            }
+            None
+        } else {
+            self.entries.insert(domain_lower, ip.to_string());
+            None
+        }
+    }
+}
+
+impl Default for DnsCache {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

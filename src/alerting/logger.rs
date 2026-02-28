@@ -28,10 +28,16 @@ impl EventLogger {
     }
 
     /// Écrit un événement dans le fichier JSON Lines.
+    /// Definit les permissions du repertoire a 0700 et du fichier a 0600.
     pub fn log(&self, event: &SecurityEvent) {
         // S'assurer que le répertoire parent existe
         if let Some(parent) = self.path.parent() {
-            let _ = fs::create_dir_all(parent);
+            if let Err(e) = fs::create_dir_all(parent) {
+                eprintln!("[counterclaw] Failed to create log directory: {}", e);
+                return;
+            }
+            // Set directory permissions to 0700 (owner-only access)
+            Self::set_directory_permissions(parent);
         }
 
         // Rotation si le fichier est trop gros
@@ -50,7 +56,12 @@ impl EventLogger {
             .create(true)
             .append(true)
             .open(&self.path)
-            .and_then(|mut file| writeln!(file, "{}", line));
+            .and_then(|mut file| {
+                writeln!(file, "{}", line)?;
+                // Set file permissions to 0600 (owner-only read/write)
+                Self::set_log_file_permissions(&self.path);
+                Ok(())
+            });
 
         if let Err(e) = result {
             eprintln!(
@@ -58,6 +69,34 @@ impl EventLogger {
                 self.path.display(),
                 e
             );
+        }
+    }
+
+    /// Set file permissions to 0600 (owner read/write only).
+    fn set_log_file_permissions(path: &std::path::Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::Permissions::from_mode(0o600);
+            let _ = fs::set_permissions(path, perms);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+        }
+    }
+
+    /// Set directory permissions to 0700 (owner-only access).
+    fn set_directory_permissions(path: &std::path::Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::Permissions::from_mode(0o700);
+            let _ = fs::set_permissions(path, perms);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
         }
     }
 

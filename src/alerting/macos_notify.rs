@@ -54,8 +54,29 @@ fn send_notification(title: &str, message: &str) {
     }
 }
 
-/// Sanitize une chaîne pour l'injection osascript :
-/// échappe les guillemets doubles et les backslashes.
-fn sanitize(input: &str) -> String {
-    input.replace('\\', "\\\\").replace('"', "\\\"")
+/// Sanitize une chaîne pour l'injection osascript.
+///
+/// Protections appliquées :
+/// - Échappe les backslashes (doit être en premier)
+/// - Échappe les guillemets doubles (syntaxe AppleScript)
+/// - Échappe les backticks (prévient l'interpolation de commandes)
+/// - Échappe le dollar sign (prévient `$()` command substitution)
+/// - Échappe les accolades (prévient le brace expansion)
+/// - Remplace les newlines/CR par des espaces (prévient l'injection multi-lignes)
+/// - Tronque à 256 caractères max (prévient les buffer overflows)
+pub fn sanitize(input: &str) -> String {
+    let mut result = input
+        .replace('\\', "\\\\") // Must be first
+        .replace('"', "\\\"")
+        .replace('`', "\\`")
+        .replace('$', "\\$")
+        .replace('{', "\\{")
+        .replace('}', "\\}")
+        .replace(['\n', '\r'], " ");
+
+    // Truncate to 256 chars max
+    if result.len() > 256 {
+        result.truncate(256);
+    }
+    result
 }

@@ -337,6 +337,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "glob",
+ "idna",
  "notify",
  "predicates",
  "regex",

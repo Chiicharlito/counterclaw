@@ -13,9 +13,47 @@ use crate::alerting::slack::SlackNotifier;
 use crate::config::AlertingConfig;
 use crate::types::{ActionTaken, EventBuffer, GuardModule, SecurityEvent, Severity};
 use chrono::{DateTime, Utc};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 use tokio::sync::mpsc;
+
+/// Per-module rate limiter for the alerting engine.
+/// Implements a sliding window of max_per_second events per module.
+struct ModuleRateLimiter {
+    /// module_name -> (window_start, count)
+    windows: HashMap<String, (Instant, u32)>,
+    max_per_second: u32,
+}
+
+impl ModuleRateLimiter {
+    fn new(max_per_second: u32) -> Self {
+        Self {
+            windows: HashMap::new(),
+            max_per_second,
+        }
+    }
+
+    /// Returns true if the event should be processed, false if rate-limited.
+    fn check(&mut self, module: &str) -> bool {
+        let now = Instant::now();
+        let entry = self.windows.entry(module.to_string()).or_insert((now, 0));
+
+        // If more than 1 second has passed, reset the window
+        if now.duration_since(entry.0).as_secs() >= 1 {
+            *entry = (now, 1);
+            return true;
+        }
+
+        // Within the same second window
+        if entry.1 < self.max_per_second {
+            entry.1 += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
 
 /// Le moteur d'alerting central.
 pub struct AlertingEngine {
@@ -24,6 +62,7 @@ pub struct AlertingEngine {
     slack: SlackNotifier,
     kill_switch: KillSwitch,
     event_buffer: Arc<RwLock<EventBuffer>>,
+    rate_limiter: ModuleRateLimiter,
 }
 
 impl AlertingEngine {
@@ -47,6 +86,7 @@ impl AlertingEngine {
             slack,
             kill_switch,
             event_buffer,
+            rate_limiter: ModuleRateLimiter::new(100),
         }
     }
 
@@ -54,6 +94,14 @@ impl AlertingEngine {
     /// le canal soit fermé (tous les senders sont droppés).
     pub async fn run(mut self, mut rx: mpsc::Receiver<SecurityEvent>) {
         while let Some(event) = rx.recv().await {
+            // 0. Rate limiting per module (max 100 events/second/module)
+            let module_name = event.module.to_string();
+            if !self.rate_limiter.check(&module_name) {
+                // Rate-limited — still log but skip notifications
+                self.logger.log(&event);
+                continue;
+            }
+
             // 1. Toujours logger dans le fichier
             self.logger.log(&event);
 
@@ -78,7 +126,8 @@ impl AlertingEngine {
                 buf.push(event.clone());
             }
 
-            // 5. Kill switch : enregistrer et vérifier
+            // 5. Kill switch : enregistrer, check reset, et vérifier
+            self.kill_switch.check_reset();
             self.kill_switch.record_event(&event);
             if self.kill_switch.should_trigger() {
                 self.kill_switch.execute(&self.logger, &self.notifier);
@@ -140,6 +189,22 @@ impl KillSwitch {
         let cutoff = Utc::now() - chrono::Duration::seconds(self.threshold_window_seconds);
         while self.recent_events.front().is_some_and(|t| *t < cutoff) {
             self.recent_events.pop_front();
+        }
+    }
+
+    /// Reset the kill switch if the time window has passed with no recent violations.
+    /// This allows the system to recover from transient bursts of events.
+    fn check_reset(&mut self) {
+        if !self.triggered {
+            return;
+        }
+        let cutoff = Utc::now() - chrono::Duration::seconds(self.threshold_window_seconds);
+        // If all recent events are outside the window, reset
+        let has_recent = self.recent_events.iter().any(|t| *t >= cutoff);
+        if !has_recent {
+            self.triggered = false;
+            self.recent_events.clear();
+            tracing::info!("Kill switch reset — no recent violations in window");
         }
     }
 
