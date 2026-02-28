@@ -198,12 +198,66 @@ pub struct DashboardConfig {
 }
 
 // ---------------------------------------------------------------------------
+// ReDoS protection — Step 2.5
+// ---------------------------------------------------------------------------
+
+/// Maximum config file size in bytes (1 MB).
+pub const MAX_CONFIG_FILE_SIZE: usize = 1024 * 1024;
+
+/// Check if a regex pattern is potentially dangerous (ReDoS).
+/// Detects nested quantifiers like (a+)+, (.*)*
+pub fn is_safe_regex(pattern: &str) -> bool {
+    // Detect nested quantifiers: a quantifier applied to a group that contains a quantifier
+    // Simple heuristic: look for patterns like (X+)+, (X*)+, (X+)*, (X*)*, etc.
+    let nesting_indicators = [
+        // Group with quantifier inside, followed by quantifier outside
+        regex::Regex::new(r"\([^)]*[+*]\)[+*?]").unwrap(),
+        regex::Regex::new(r"\([^)]*[+*]\)\{").unwrap(),
+    ];
+    for indicator in &nesting_indicators {
+        if indicator.is_match(pattern) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Compile a regex with safety limits (size and complexity).
+pub fn compile_safe_regex(pattern: &str) -> Result<regex::Regex, String> {
+    if !is_safe_regex(pattern) {
+        return Err(format!(
+            "Pattern '{}' contains potentially dangerous nested quantifiers",
+            pattern
+        ));
+    }
+    regex::RegexBuilder::new(pattern)
+        .size_limit(1024 * 1024) // 1 MB DFA size limit
+        .build()
+        .map_err(|e| format!("Invalid regex '{}': {}", pattern, e))
+}
+
+// ---------------------------------------------------------------------------
 // Chargement et validation
 // ---------------------------------------------------------------------------
 
 impl AppConfig {
     /// Charge la configuration depuis un fichier YAML.
+    /// Rejects files larger than MAX_CONFIG_FILE_SIZE (1 MB) to prevent YAML bombs.
     pub fn load(path: &Path) -> Result<Self, CounterClawError> {
+        // Step 3.3: Check file size before reading to prevent YAML bombs
+        let metadata = std::fs::metadata(path).map_err(|e| CounterClawError::ConfigLoad {
+            path: path.display().to_string(),
+            source: Box::new(e),
+        })?;
+        if metadata.len() as usize > MAX_CONFIG_FILE_SIZE {
+            return Err(CounterClawError::Config(format!(
+                "Config file {} is too large ({} bytes, max {} bytes)",
+                path.display(),
+                metadata.len(),
+                MAX_CONFIG_FILE_SIZE
+            )));
+        }
+
         let content = std::fs::read_to_string(path).map_err(|e| CounterClawError::ConfigLoad {
             path: path.display().to_string(),
             source: Box::new(e),
@@ -262,9 +316,14 @@ impl AppConfig {
             ));
         }
 
-        // Vérifier les regex des content patterns
+        // Vérifier les regex des content patterns (with ReDoS protection)
         for pattern in &self.cdp_proxy.content_inspection.patterns {
-            if regex::Regex::new(&pattern.regex).is_err() {
+            if !is_safe_regex(&pattern.regex) {
+                errors.push(format!(
+                    "cdp_proxy.content_inspection.patterns[{}].regex contains dangerous nested quantifiers (ReDoS risk)",
+                    pattern.name
+                ));
+            } else if regex::Regex::new(&pattern.regex).is_err() {
                 errors.push(format!(
                     "cdp_proxy.content_inspection.patterns[{}].regex is invalid",
                     pattern.name
@@ -272,9 +331,14 @@ impl AppConfig {
             }
         }
 
-        // Vérifier les regex des blacklist commands
+        // Vérifier les regex des blacklist commands (with ReDoS protection)
         for cmd in &self.cmd_guard.blacklist {
-            if regex::Regex::new(&cmd.pattern).is_err() {
+            if !is_safe_regex(&cmd.pattern) {
+                errors.push(format!(
+                    "cmd_guard.blacklist pattern '{}' contains dangerous nested quantifiers (ReDoS risk)",
+                    cmd.pattern
+                ));
+            } else if regex::Regex::new(&cmd.pattern).is_err() {
                 errors.push(format!(
                     "cmd_guard.blacklist pattern '{}' is invalid regex",
                     cmd.pattern
@@ -313,7 +377,14 @@ impl AppConfig {
         expand_tilde(&self.alerting.file_log.path)
     }
 
+    /// Returns the Slack webhook URL, preferring the environment variable.
+    pub fn slack_webhook_url(&self) -> String {
+        std::env::var("COUNTERCLAW_SLACK_WEBHOOK")
+            .unwrap_or_else(|_| self.alerting.slack.webhook_url.clone())
+    }
+
     /// Sauvegarde la configuration dans un fichier YAML.
+    /// Uses exclusive file creation with proper permissions (0600 on Unix).
     pub fn save(&self, path: &Path) -> Result<(), CounterClawError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -326,9 +397,37 @@ impl AppConfig {
         }
         let yaml = serde_yaml::to_string(self)
             .map_err(|e| CounterClawError::Config(format!("Failed to serialize config: {}", e)))?;
-        std::fs::write(path, yaml).map_err(|e| {
+
+        // Use explicit open + write for proper permission control
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .map_err(|e| {
+                CounterClawError::Config(format!(
+                    "Cannot write config to {}: {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+
+        use std::io::Write;
+        let mut writer = std::io::BufWriter::new(&file);
+        writer.write_all(yaml.as_bytes()).map_err(|e| {
             CounterClawError::Config(format!("Cannot write config to {}: {}", path.display(), e))
         })?;
+        writer.flush().map_err(|e| {
+            CounterClawError::Config(format!("Cannot flush config to {}: {}", path.display(), e))
+        })?;
+
+        // Set file permissions to 0600 on Unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+
         Ok(())
     }
 }

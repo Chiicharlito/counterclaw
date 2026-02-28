@@ -22,12 +22,54 @@ use tokio::sync::mpsc;
 // PID file management
 // ---------------------------------------------------------------------------
 
-/// Écrit le PID dans un fichier.
-pub fn write_pid_file(path: &Path, pid: u32) -> Result<(), std::io::Error> {
+/// Écrit le PID dans un fichier avec protections de sécurité :
+/// - Refuse d'écrire si le chemin est un symlink (attaque de symlink)
+/// - Création exclusive (échoue si le fichier existe déjà)
+/// - Vérifie si un PID existant est encore vivant avant de le remplacer
+/// - Permissions 0644 sur Unix après création
+pub fn write_pid_file(path: &Path, pid: u32) -> anyhow::Result<()> {
+    // Step 2.6: Check for symlink attack
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!("PID file path is a symlink — refusing to write (possible attack)");
+        }
+        // File exists — check if the process is still running
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if let Ok(existing_pid) = content.trim().parse::<u32>() {
+                let mut sys = sysinfo::System::new();
+                sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+                let pid_native = sysinfo::Pid::from_u32(existing_pid);
+                if sys.process(pid_native).is_some() {
+                    anyhow::bail!("Another instance is already running (PID {})", existing_pid);
+                }
+            }
+        }
+        // Stale PID file — remove it
+        std::fs::remove_file(path)?;
+    }
+
+    // Create parent directory if needed
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, pid.to_string())
+
+    // Exclusive creation
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+
+    write!(file, "{}", pid)?;
+
+    // Set permissions to 0644
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644));
+    }
+
+    Ok(())
 }
 
 /// Lit le PID depuis un fichier.
@@ -182,7 +224,8 @@ impl Daemon {
 
         // Démarrer le dashboard HTTP si activé
         let dashboard_handle = if dashboard_enabled {
-            let router = crate::dashboard::server::build_router(Arc::clone(&state));
+            let dashboard_state = crate::dashboard::server::DashboardState::new(Arc::clone(&state));
+            let router = crate::dashboard::server::build_router(dashboard_state);
             match tokio::net::TcpListener::bind(&dashboard_addr).await {
                 Ok(listener) => {
                     tracing::info!("Dashboard listening on {}", dashboard_addr);

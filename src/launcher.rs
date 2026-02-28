@@ -3,7 +3,41 @@
 //! Sépare la logique pure (génération XML, construction de commandes)
 //! des opérations IO (écriture fichier, exécution launchctl).
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+
+// ---------------------------------------------------------------------------
+// InstallMode — LaunchDaemon (root) vs LaunchAgent (user)
+// ---------------------------------------------------------------------------
+
+/// Mode d'installation du service launchd.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InstallMode {
+    /// Root LaunchDaemon (/Library/LaunchDaemons/, /etc/counterclaw/)
+    Daemon,
+    /// User LaunchAgent (~/Library/LaunchAgents/, ~/.counterclaw/) — dev/test
+    Agent,
+}
+
+// ---------------------------------------------------------------------------
+// Daemon path constants — used in root LaunchDaemon mode
+// ---------------------------------------------------------------------------
+
+/// Répertoire de configuration pour le mode Daemon.
+pub const DAEMON_CONFIG_DIR: &str = "/etc/counterclaw";
+/// Chemin du fichier de configuration pour le mode Daemon.
+pub const DAEMON_CONFIG_PATH: &str = "/etc/counterclaw/config.yaml";
+/// Répertoire de logs pour le mode Daemon.
+pub const DAEMON_LOG_DIR: &str = "/var/log/counterclaw";
+/// Chemin du fichier PID pour le mode Daemon.
+pub const DAEMON_PID_PATH: &str = "/var/run/counterclaw.pid";
+/// Répertoire d'installation du plist pour le mode Daemon.
+pub const DAEMON_PLIST_DIR: &str = "/Library/LaunchDaemons";
+/// Chemin du binaire pour le mode Daemon.
+pub const DAEMON_BINARY_PATH: &str = "/usr/local/bin/counterclaw";
+/// Chemin du token API pour le mode Daemon.
+pub const DAEMON_API_TOKEN_PATH: &str = "/etc/counterclaw/api.token";
 
 // ---------------------------------------------------------------------------
 // XML escaping — sécurité
@@ -70,6 +104,86 @@ pub fn generate_plist(label: &str, binary_path: &str, config_path: Option<&str>)
 "#,
         label_escaped, program_args
     )
+}
+
+/// Génère le contenu XML d'un plist launchd pour un mode spécifique.
+///
+/// - `label` : identifiant du service (ex: "io.counterclaw.daemon")
+/// - `binary_path` : chemin absolu vers le binaire
+/// - `config_path` : chemin optionnel vers le fichier de config
+/// - `mode` : Daemon (root) ou Agent (user)
+pub fn generate_plist_for_mode(
+    label: &str,
+    binary_path: &str,
+    config_path: Option<&str>,
+    mode: InstallMode,
+) -> String {
+    let label_escaped = escape_xml(label);
+    let binary_escaped = escape_xml(binary_path);
+
+    let mut program_args = format!(
+        "    <key>ProgramArguments</key>\n    <array>\n        <string>{}</string>\n        <string>start</string>\n",
+        binary_escaped
+    );
+
+    if let Some(cfg) = config_path {
+        let cfg_escaped = escape_xml(cfg);
+        program_args.push_str(&format!(
+            "        <string>--config</string>\n        <string>{}</string>\n",
+            cfg_escaped
+        ));
+    }
+
+    program_args.push_str("    </array>");
+
+    let (run_at_load, stdout_path, stderr_path) = match mode {
+        InstallMode::Daemon => (
+            "<true/>",
+            "/var/log/counterclaw/counterclaw-stdout.log",
+            "/var/log/counterclaw/counterclaw-stderr.log",
+        ),
+        InstallMode::Agent => (
+            "<false/>",
+            "/tmp/counterclaw-stdout.log",
+            "/tmp/counterclaw-stderr.log",
+        ),
+    };
+
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{}</string>
+{}
+    <key>RunAtLoad</key>
+    {}
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{}</string>
+    <key>StandardErrorPath</key>
+    <string>{}</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
+"#,
+        label_escaped, program_args, run_at_load, stdout_path, stderr_path
+    )
+}
+
+/// Retourne le chemin d'installation du plist pour un mode donné.
+///
+/// - Daemon: /Library/LaunchDaemons/{label}.plist
+/// - Agent: ~/Library/LaunchAgents/{label}.plist
+pub fn plist_install_path_for_mode(label: &str, mode: InstallMode) -> PathBuf {
+    match mode {
+        InstallMode::Daemon => PathBuf::from(DAEMON_PLIST_DIR).join(format!("{}.plist", label)),
+        InstallMode::Agent => plist_install_path(label),
+    }
 }
 
 /// Retourne le chemin d'installation du plist dans ~/Library/LaunchAgents/.
@@ -165,4 +279,23 @@ impl LaunchdLauncher {
 
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Plist integrity verification — Step 3.7
+// ---------------------------------------------------------------------------
+
+/// Compute a simple hash of plist content for integrity verification.
+pub fn compute_plist_hash(content: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    content.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Verify that a plist file matches the expected hash.
+/// Returns Ok(true) if matches, Ok(false) if tampered, Err if file can't be read.
+pub fn verify_plist_integrity(plist_path: &Path, expected_hash: u64) -> Result<bool, String> {
+    let content =
+        std::fs::read_to_string(plist_path).map_err(|e| format!("Cannot read plist: {}", e))?;
+    Ok(compute_plist_hash(&content) == expected_hash)
 }

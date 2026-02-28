@@ -5,6 +5,13 @@
 
 use crate::config::SlackConfig;
 use crate::types::{SecurityEvent, Severity};
+use std::time::Duration;
+
+/// Nombre maximum de retries apres l'echec initial.
+const MAX_RETRIES: u32 = 3;
+
+/// Timeout par requete HTTP en secondes.
+const REQUEST_TIMEOUT_SECS: u64 = 10;
 
 /// Notificateur Slack — formate et envoie des alertes via webhook.
 #[derive(Clone)]
@@ -18,14 +25,19 @@ pub struct SlackNotifier {
 
 impl SlackNotifier {
     /// Cree un nouveau notificateur depuis la configuration.
+    /// Le client HTTP est configure avec un timeout de 10 secondes par requete.
     pub fn new(config: &SlackConfig) -> Self {
         let min_severity = parse_severity(&config.min_severity);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             enabled: config.enabled,
             webhook_url: config.webhook_url.clone(),
             channel: config.channel.clone(),
             min_severity,
-            client: reqwest::Client::new(),
+            client,
         }
     }
 
@@ -99,7 +111,8 @@ impl SlackNotifier {
     }
 
     /// Envoie un evenement via le webhook Slack.
-    /// Retry une fois en cas d'echec.
+    /// Utilise un backoff exponentiel : 1s, 2s, 4s entre les retries.
+    /// Maximum 3 retries apres l'echec initial.
     pub async fn send(&self, event: &SecurityEvent) -> Result<(), String> {
         if !self.should_notify(event) {
             return Ok(());
@@ -109,14 +122,34 @@ impl SlackNotifier {
 
         // First attempt
         match self.post_webhook(&payload).await {
-            Ok(()) => Ok(()),
-            Err(_first_err) => {
-                // Retry once
-                self.post_webhook(&payload)
-                    .await
-                    .map_err(|e| format!("Slack webhook failed after retry: {}", e))
+            Ok(()) => return Ok(()),
+            Err(first_err) => {
+                tracing::warn!("Slack webhook attempt 1 failed: {}", first_err);
             }
         }
+
+        // Exponential backoff retries: 1s, 2s, 4s
+        for retry in 0..MAX_RETRIES {
+            let delay_secs = 1u64 << retry; // 1, 2, 4
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+
+            match self.post_webhook(&payload).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    tracing::warn!(
+                        "Slack webhook retry {} failed (waited {}s): {}",
+                        retry + 1,
+                        delay_secs,
+                        e
+                    );
+                }
+            }
+        }
+
+        Err(format!(
+            "Slack webhook failed after {} retries with exponential backoff",
+            MAX_RETRIES
+        ))
     }
 
     /// POST vers le webhook Slack.

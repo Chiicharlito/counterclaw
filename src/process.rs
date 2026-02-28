@@ -1,10 +1,10 @@
-//! Détection et gestion des processus OpenClaw.
+//! Detection et gestion des processus OpenClaw.
 //!
 //! Deux couches :
 //! 1. **Logique pure** : `matches_process_patterns()` compare un nom/commande
-//!    de processus contre une liste de patterns (exact ou regex). Zéro IO.
-//! 2. **Couche système** : `ProcessScanner` utilise `sysinfo` pour lister
-//!    les processus réels. `kill_process()` envoie SIGKILL.
+//!    de processus contre une liste de patterns (exact ou regex). Zero IO.
+//! 2. **Couche systeme** : `ProcessScanner` utilise `sysinfo` pour lister
+//!    les processus reels. `kill_process()` envoie SIGKILL.
 
 use regex::Regex;
 use sysinfo::System;
@@ -13,9 +13,9 @@ use sysinfo::System;
 // Types
 // ---------------------------------------------------------------------------
 
-/// Informations sur un processus détecté.
-/// Distinct de `types::ProcessInfo` qui est le format d'événement sérialisable.
-/// Celui-ci est utilisé pour le scanning interne.
+/// Informations sur un processus detecte.
+/// Distinct de `types::ProcessInfo` qui est le format d'evenement serialisable.
+/// Celui-ci est utilise pour le scanning interne.
 #[derive(Debug, Clone)]
 pub struct ProcessInfo {
     pub pid: u32,
@@ -28,12 +28,12 @@ pub struct ProcessInfo {
 // Logique pure — pattern matching
 // ---------------------------------------------------------------------------
 
-/// Vérifie si un processus (nom + ligne de commande) correspond à au moins
+/// Verifie si un processus (nom + ligne de commande) correspond a au moins
 /// un pattern dans la liste.
 ///
-/// Chaque pattern est d'abord testé comme match exact sur le nom,
-/// puis comme regex sur la ligne de commande complète.
-/// Les regex invalides sont silencieusement ignorées.
+/// Chaque pattern est d'abord teste comme match exact sur le nom,
+/// puis comme regex sur la ligne de commande complete.
+/// Les regex invalides sont silencieusement ignorees.
 pub fn matches_process_patterns(name: &str, cmd: &str, patterns: &[String]) -> bool {
     if name.is_empty() && cmd.is_empty() {
         return false;
@@ -45,7 +45,7 @@ pub fn matches_process_patterns(name: &str, cmd: &str, patterns: &[String]) -> b
             return true;
         }
 
-        // Match regex sur la ligne de commande complète
+        // Match regex sur la ligne de commande complete
         if let Ok(re) = Regex::new(pattern) {
             if re.is_match(cmd) {
                 return true;
@@ -57,7 +57,50 @@ pub fn matches_process_patterns(name: &str, cmd: &str, patterns: &[String]) -> b
 }
 
 // ---------------------------------------------------------------------------
-// Couche système — scanning via sysinfo
+// argv[0] vs binary path mismatch detection
+// ---------------------------------------------------------------------------
+
+/// Verifie si argv[0] (le nom du processus) ne correspond pas au chemin
+/// reel du binaire dans la ligne de commande.
+///
+/// Cela peut indiquer un processus qui tente de se deguiser (spoofing).
+/// Par exemple, un processus qui se fait passer pour "bash" alors que
+/// son binaire reel est "/tmp/malware".
+///
+/// Retourne true si une divergence est detectee (potentiel spoofing).
+/// Retourne false si les noms correspondent, ou si la commande est vide
+/// ou ne contient pas d'information exploitable.
+#[allow(dead_code)]
+pub fn check_argv0_mismatch(name: &str, cmd: &str) -> bool {
+    // If either is empty, we can't compare
+    if name.is_empty() || cmd.is_empty() {
+        return false;
+    }
+
+    // Extract the first argument from cmd (the binary path)
+    let first_arg = cmd.split_whitespace().next();
+    let first_arg = match first_arg {
+        Some(arg) => arg,
+        None => return false,
+    };
+
+    // Get the filename from the binary path
+    let binary_filename = std::path::Path::new(first_arg)
+        .file_name()
+        .and_then(|n| n.to_str());
+
+    let binary_filename = match binary_filename {
+        Some(f) => f,
+        None => return false,
+    };
+
+    // Compare: if the process name doesn't match the binary filename,
+    // this is a potential spoofing indicator
+    name != binary_filename
+}
+
+// ---------------------------------------------------------------------------
+// Couche systeme — scanning via sysinfo
 // ---------------------------------------------------------------------------
 
 /// Scanner de processus utilisant `sysinfo`.
@@ -72,14 +115,14 @@ impl Default for ProcessScanner {
 }
 
 impl ProcessScanner {
-    /// Crée un nouveau scanner avec la liste de processus rafraîchie.
+    /// Cree un nouveau scanner avec la liste de processus rafraichie.
     pub fn new() -> Self {
         let mut system = System::new();
         system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
         Self { system }
     }
 
-    /// Rafraîchit la liste des processus.
+    /// Rafraichit la liste des processus.
     pub fn refresh(&mut self) {
         self.system
             .refresh_processes(sysinfo::ProcessesToUpdate::All, true);
@@ -117,9 +160,9 @@ impl ProcessScanner {
 // Kill process
 // ---------------------------------------------------------------------------
 
-/// Envoie SIGKILL à un processus par PID.
-/// Retourne Ok(true) si le signal a été envoyé, Ok(false) si le process
-/// n'a pas été trouvé, Err si une erreur système survient.
+/// Envoie SIGKILL a un processus par PID.
+/// Retourne Ok(true) si le signal a ete envoye, Ok(false) si le process
+/// n'a pas ete trouve, Err si une erreur systeme survient.
 pub fn kill_process(pid: u32) -> anyhow::Result<bool> {
     let mut system = System::new();
     system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
