@@ -13,7 +13,8 @@ use counterclaw::config::{self, default_config_path, expand_tilde};
 use counterclaw::guards::cdp_proxy::DomainMatcher;
 use counterclaw::guards::cmd_guard::{CommandMatcher, MatchType};
 use counterclaw::guards::fs_guard::{PathMatcher, PathVerdict};
-use counterclaw::types::{ActionTaken, GuardModule, SecurityEvent, Severity};
+use counterclaw::types::{ActionTaken, EventBuffer, GuardModule, SecurityEvent, Severity};
+use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 
 // ---------------------------------------------------------------------------
@@ -282,11 +283,12 @@ async fn cmd_start(config_path: Option<String>) {
     println!("Mode: {}", mode);
     println!();
 
-    // 3. Créer le canal mpsc pour les événements
+    // 3. Créer le canal mpsc et le buffer d'événements
     let (alert_tx, alert_rx) = mpsc::channel::<SecurityEvent>(1000);
+    let event_buffer = Arc::new(RwLock::new(EventBuffer::new(10000)));
 
     // 4. Lancer le moteur d'alerting dans sa propre tâche
-    let engine = AlertingEngine::new(&app_config.alerting);
+    let engine = AlertingEngine::new(&app_config.alerting, event_buffer);
     let engine_handle = tokio::spawn(async move {
         engine.run(alert_rx).await;
     });

@@ -2,29 +2,33 @@
 //!
 //! L'engine tourne dans sa propre tâche tokio. Il reçoit les SecurityEvent
 //! de tous les modules via un canal mpsc, et les dispatche vers les
-//! différents backends : logger, notification macOS, (et plus tard Slack).
+//! différents backends : logger, notification macOS, Slack.
 //!
 //! Le kill switch vit aussi ici : il compte les violations récentes
 //! et déclenche une action si le seuil est dépassé.
 
 use crate::alerting::logger::EventLogger;
 use crate::alerting::macos_notify::MacosNotifier;
+use crate::alerting::slack::SlackNotifier;
 use crate::config::AlertingConfig;
-use crate::types::{ActionTaken, GuardModule, SecurityEvent, Severity};
+use crate::types::{ActionTaken, EventBuffer, GuardModule, SecurityEvent, Severity};
 use chrono::{DateTime, Utc};
 use std::collections::VecDeque;
+use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 
 /// Le moteur d'alerting central.
 pub struct AlertingEngine {
     logger: EventLogger,
     notifier: MacosNotifier,
+    slack: SlackNotifier,
     kill_switch: KillSwitch,
+    event_buffer: Arc<RwLock<EventBuffer>>,
 }
 
 impl AlertingEngine {
-    /// Crée le moteur d'alerting à partir de la configuration.
-    pub fn new(config: &AlertingConfig) -> Self {
+    /// Crée le moteur d'alerting à partir de la configuration et d'un buffer partagé.
+    pub fn new(config: &AlertingConfig, event_buffer: Arc<RwLock<EventBuffer>>) -> Self {
         let logger = EventLogger::new(
             &config.file_log.path,
             config.file_log.max_size_mb,
@@ -33,12 +37,16 @@ impl AlertingEngine {
 
         let notifier = MacosNotifier::new(config.macos_notification.enabled);
 
+        let slack = SlackNotifier::new(&config.slack);
+
         let kill_switch = KillSwitch::new(&config.kill_switch);
 
         Self {
             logger,
             notifier,
+            slack,
             kill_switch,
+            event_buffer,
         }
     }
 
@@ -54,7 +62,23 @@ impl AlertingEngine {
                 self.notifier.send(&event);
             }
 
-            // 3. Kill switch : enregistrer et vérifier
+            // 3. Slack notification (async, best-effort)
+            if self.slack.should_notify(&event) {
+                let slack = self.slack.clone();
+                let event_clone = event.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = slack.send(&event_clone).await {
+                        tracing::warn!("Slack notification failed: {}", e);
+                    }
+                });
+            }
+
+            // 4. Push event dans le buffer partagé
+            if let Ok(mut buf) = self.event_buffer.write() {
+                buf.push(event.clone());
+            }
+
+            // 5. Kill switch : enregistrer et vérifier
             self.kill_switch.record_event(&event);
             if self.kill_switch.should_trigger() {
                 self.kill_switch.execute(&self.logger, &self.notifier);
