@@ -289,3 +289,87 @@ async fn run_until_signal_starts_dashboard() {
 
     handle.abort();
 }
+
+// ---------------------------------------------------------------------------
+// Step 6.6 — Integration: Daemon with I/O guards
+// ---------------------------------------------------------------------------
+
+/// Helper: config with CDP proxy enabled on a free port.
+fn config_with_cdp_proxy(env: &common::TestEnv) -> AppConfig {
+    let mut config = load_config(env);
+    let cdp_port = common::find_free_port();
+    config.cdp_proxy.enabled = true;
+    config.cdp_proxy.listen_port = cdp_port;
+    config.cdp_proxy.bind_address = "127.0.0.1".to_string();
+    config.cdp_proxy.upstream_port = common::find_free_port(); // no real Chrome
+    config
+}
+
+/// Le daemon démarre le CDP proxy et le rend accessible.
+#[tokio::test]
+async fn daemon_cdp_proxy_reachable() {
+    let env = common::TestEnv::new();
+    let config = config_with_cdp_proxy(&env);
+    let cdp_port = config.cdp_proxy.listen_port;
+
+    let buffer = Arc::new(RwLock::new(EventBuffer::new(100)));
+    let daemon = Daemon::new(config, buffer);
+
+    let handle = tokio::spawn(async move {
+        daemon.run_until_signal().await;
+    });
+
+    // Give the CDP proxy time to bind
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    // CDP proxy discovery endpoint should be reachable
+    // It will return an error (no Chrome upstream), but the port should respond
+    let result = reqwest::get(format!("http://127.0.0.1:{}/json/version", cdp_port)).await;
+    assert!(
+        result.is_ok(),
+        "CDP proxy should be reachable on port {}",
+        cdp_port
+    );
+
+    handle.abort();
+}
+
+/// Le daemon démarre et arrête tous les gardes proprement avec le lifecycle complet.
+#[tokio::test]
+async fn daemon_full_lifecycle() {
+    let env = common::TestEnv::new();
+    let config = config_with_cdp_proxy(&env);
+    let cdp_port = config.cdp_proxy.listen_port;
+    let dashboard_port = common::find_free_port();
+
+    let mut config = config;
+    config.dashboard.enabled = true;
+    config.dashboard.port = dashboard_port;
+
+    let buffer = Arc::new(RwLock::new(EventBuffer::new(100)));
+    let daemon = Daemon::new(config, buffer.clone());
+
+    let handle = tokio::spawn(async move {
+        daemon.run_until_signal().await;
+    });
+
+    // Wait for everything to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    // Both services should be reachable
+    let cdp = reqwest::get(format!("http://127.0.0.1:{}/json/version", cdp_port)).await;
+    assert!(cdp.is_ok(), "CDP proxy should be reachable");
+
+    let dash = reqwest::get(format!("http://127.0.0.1:{}/api/health", dashboard_port)).await;
+    assert!(dash.is_ok(), "Dashboard should be reachable");
+
+    // Buffer should have startup event
+    let buf = buffer.read().unwrap();
+    let events = buf.query(0, None, Some(&GuardModule::System), None);
+    assert!(
+        events.iter().any(|e| e.description.contains("started")),
+        "Should have startup event"
+    );
+
+    handle.abort();
+}

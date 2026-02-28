@@ -4,14 +4,15 @@
 //! 1. **CommandMatcher** (logique pure) : commande + règles → verdict
 //! 2. **CmdGuard** (Guard trait) : polling processus → détection → mpsc
 
-use crate::config::CmdGuardConfig;
+use crate::config::{AppConfig, CmdGuardConfig};
 use crate::types::{Guard, GuardStatus, SecurityEvent, Severity};
 use chrono::{Duration, Utc};
 use regex::Regex;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
 // CommandVerdict — résultat du matching d'une commande
@@ -221,17 +222,25 @@ pub struct CmdGuard {
     events_total: Arc<AtomicU64>,
     events_blocked: Arc<AtomicU64>,
     start_time: Arc<std::sync::Mutex<Option<chrono::DateTime<Utc>>>>,
+    cancel_token: CancellationToken,
+    task_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Shared config for hot-reload and mode access (used in start() I/O layer).
+    #[allow(dead_code)]
+    app_config: Arc<RwLock<AppConfig>>,
 }
 
 impl CmdGuard {
     /// Crée un nouveau CmdGuard à partir de la configuration.
-    pub fn new(config: &CmdGuardConfig) -> Self {
+    pub fn new(config: &CmdGuardConfig, app_config: Arc<RwLock<AppConfig>>) -> Self {
         Self {
             config: config.clone(),
             running: Arc::new(AtomicBool::new(false)),
             events_total: Arc::new(AtomicU64::new(0)),
             events_blocked: Arc::new(AtomicU64::new(0)),
             start_time: Arc::new(std::sync::Mutex::new(None)),
+            cancel_token: CancellationToken::new(),
+            task_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            app_config,
         }
     }
 }
@@ -242,14 +251,110 @@ impl Guard for CmdGuard {
         "cmd_guard"
     }
 
-    async fn start(&self, _alert_tx: mpsc::Sender<SecurityEvent>) -> anyhow::Result<()> {
+    async fn start(&self, alert_tx: mpsc::Sender<SecurityEvent>) -> anyhow::Result<()> {
         self.running.store(true, Ordering::SeqCst);
         *self.start_time.lock().expect("lock poisoned") = Some(Utc::now());
 
         if self.config.enabled {
-            let _matcher = CommandMatcher::new(&self.config);
-            let _seen_pids: HashSet<u32> = HashSet::new();
-            // Le polling serait lancé dans un tokio::task ici
+            let matcher = CommandMatcher::new(&self.config);
+            let cancel = self.cancel_token.clone();
+            let app_config = Arc::clone(&self.app_config);
+            let events_total = Arc::clone(&self.events_total);
+            let events_blocked = Arc::clone(&self.events_blocked);
+
+            let handle = tokio::spawn(async move {
+                let mut scanner = crate::process::ProcessScanner::new();
+                let mut seen_pids: HashSet<u32> = HashSet::new();
+
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
+                            tracing::info!("Cmd Guard polling shutting down");
+                            break;
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                            scanner.refresh();
+                            let all_procs = scanner.scan_all();
+
+                            // Get current mode
+                            let mode = app_config
+                                .read()
+                                .ok()
+                                .map(|cfg| match cfg.general.mode.as_str() {
+                                    "enforce" => crate::types::OperationMode::Enforce,
+                                    "paranoid" => crate::types::OperationMode::Paranoid,
+                                    _ => crate::types::OperationMode::Monitor,
+                                })
+                                .unwrap_or(crate::types::OperationMode::Monitor);
+
+                            // Prune dead PIDs (no longer in process list)
+                            let active_pids: HashSet<u32> =
+                                all_procs.iter().map(|p| p.pid).collect();
+                            seen_pids.retain(|pid| active_pids.contains(pid));
+
+                            for proc in &all_procs {
+                                // Skip already-seen PIDs
+                                if seen_pids.contains(&proc.pid) {
+                                    continue;
+                                }
+
+                                // V10: argv[0] mismatch detection
+                                if crate::process::check_argv0_mismatch(&proc.name, &proc.cmd) {
+                                    tracing::warn!(
+                                        "argv[0] mismatch: name='{}' cmd='{}' pid={}",
+                                        proc.name,
+                                        proc.cmd,
+                                        proc.pid
+                                    );
+                                }
+
+                                // Check command against matcher.
+                                // On macOS, sysinfo often returns empty cmd() for processes.
+                                // Fall back to checking proc.name if cmd is empty.
+                                let check_str = if proc.cmd.trim().is_empty() {
+                                    &proc.name
+                                } else {
+                                    &proc.cmd
+                                };
+                                if let Some(verdict) = matcher.match_command(check_str, &mode) {
+                                    seen_pids.insert(proc.pid);
+                                    events_total.fetch_add(1, Ordering::SeqCst);
+
+                                    match verdict.match_type {
+                                        MatchType::Blacklisted => {
+                                            events_blocked.fetch_add(1, Ordering::SeqCst);
+                                            let event = SecurityEvent::new(
+                                                crate::types::GuardModule::CmdGuard,
+                                                verdict.severity,
+                                                crate::types::ActionTaken::Blocked,
+                                                format!(
+                                                    "Blacklisted command detected (pid {}): {}",
+                                                    proc.pid, verdict.description
+                                                ),
+                                            );
+                                            let _ = alert_tx.try_send(event);
+                                        }
+                                        MatchType::RequiresApproval => {
+                                            let event = SecurityEvent::new(
+                                                crate::types::GuardModule::CmdGuard,
+                                                Severity::Warning,
+                                                crate::types::ActionTaken::Alerted,
+                                                format!(
+                                                    "Command requires approval (pid {}): {}",
+                                                    proc.pid, verdict.description
+                                                ),
+                                            );
+                                            let _ = alert_tx.try_send(event);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            *self.task_handle.lock().await = Some(handle);
         }
 
         Ok(())
@@ -257,6 +362,10 @@ impl Guard for CmdGuard {
 
     async fn stop(&self) -> anyhow::Result<()> {
         self.running.store(false, Ordering::SeqCst);
+        self.cancel_token.cancel();
+        if let Some(handle) = self.task_handle.lock().await.take() {
+            let _ = handle.await;
+        }
         Ok(())
     }
 

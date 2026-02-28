@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 CounterClaw is an OS-level daemon (Rust) that protects machines from autonomous AI agents (like OpenClaw) exfiltrating sensitive data. It runs independently from the AI agent — no plugin, no skill, no prompt can disable it.
 
-**Status**: All 5 phases complete. 259 tests passing. `PROJECT_OVERVIEW.md` is the single source of truth for the full technical specification (written in French).
+**Status**: All 5 phases + Phase 6 (Guard I/O) complete. 457 tests passing. All 4 guards connected to real-world I/O (CDP WebSocket proxy, filesystem watcher, process polling, lsof polling). `PROJECT_OVERVIEW.md` is the single source of truth for the full technical specification (written in French).
 
 **Target**: macOS primary, Linux secondary.
 
@@ -108,7 +108,11 @@ tests/
 ├── cli_status_test.rs   # 5 tests — CLI status command
 ├── launcher_test.rs     # 13 tests — launcher/plist generation
 ├── daemon_cli_test.rs   # 3 tests — daemon CLI subcommands
-└── cli_logs_test.rs     # 6 tests — logs + dashboard CLI
+├── cli_logs_test.rs     # 6 tests — logs + dashboard CLI
+├── cdp_proxy_io_test.rs # 11 tests — CDP proxy I/O (HTTP + WebSocket)
+├── fs_guard_io_test.rs  # 8 tests — FS guard notify watcher
+├── cmd_guard_io_test.rs # 5 tests — Cmd guard process polling
+└── net_guard_io_test.rs # 5 tests — Net guard lsof polling
 ```
 
 ## Implementation Build Order

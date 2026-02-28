@@ -5,13 +5,14 @@
 //! 2. **FsEventHandler** (orchestration) : reçoit events notify → filtre → mpsc
 //! 3. **FsGuard** (Guard trait) : lifecycle start/stop/status
 
-use crate::config::{expand_tilde, FsGuardConfig};
+use crate::config::{expand_tilde, AppConfig, FsGuardConfig};
 use crate::types::{ActionTaken, Guard, GuardModule, GuardStatus, SecurityEvent, Severity};
 use chrono::{Duration, Utc};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
 // Self-protection paths — always blocked regardless of mode or user config
@@ -411,11 +412,16 @@ pub struct FsGuard {
     /// V13: Watchdog — tracks the last time an event was processed.
     /// Used to detect if the notify watcher has stalled.
     last_activity: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    cancel_token: CancellationToken,
+    task_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Shared config for hot-reload and mode access (used in start() I/O layer).
+    #[allow(dead_code)]
+    app_config: Arc<RwLock<AppConfig>>,
 }
 
 impl FsGuard {
     /// Crée un nouveau FsGuard à partir de la configuration.
-    pub fn new(config: &FsGuardConfig) -> Self {
+    pub fn new(config: &FsGuardConfig, app_config: Arc<RwLock<AppConfig>>) -> Self {
         Self {
             config: config.clone(),
             running: Arc::new(AtomicBool::new(false)),
@@ -423,6 +429,9 @@ impl FsGuard {
             events_blocked: Arc::new(AtomicU64::new(0)),
             start_time: Arc::new(std::sync::Mutex::new(None)),
             last_activity: Arc::new(std::sync::Mutex::new(None)),
+            cancel_token: CancellationToken::new(),
+            task_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            app_config,
         }
     }
 
@@ -489,23 +498,151 @@ impl Guard for FsGuard {
         "fs_guard"
     }
 
-    async fn start(&self, _alert_tx: mpsc::Sender<SecurityEvent>) -> anyhow::Result<()> {
+    async fn start(&self, alert_tx: mpsc::Sender<SecurityEvent>) -> anyhow::Result<()> {
         self.running.store(true, Ordering::SeqCst);
         *self.start_time.lock().expect("lock poisoned") = Some(Utc::now());
         // V13: Initialize watchdog timestamp at start
         *self.last_activity.lock().expect("watchdog lock") = Some(std::time::Instant::now());
 
-        // Phase 2 MVP : le watcher notify est lancé ici.
-        // Pour les tests unitaires, on valide le lifecycle (start/stop/status).
-        // L'intégration avec notify sera complétée quand on branche au daemon.
-
         if self.config.enabled {
-            let _matcher = PathMatcher::new(
+            let matcher = PathMatcher::new(
                 self.config.blocked_paths.clone(),
                 self.config.read_only_paths.clone(),
                 self.config.allowed_paths.clone(),
             );
-            // Le watcher serait lancé dans un tokio::task ici
+
+            // Collect paths to watch (blocked + read_only)
+            let mut watch_paths: Vec<PathBuf> = Vec::new();
+            for p in self
+                .config
+                .blocked_paths
+                .iter()
+                .chain(self.config.read_only_paths.iter())
+            {
+                let expanded = expand_tilde(p);
+                // Skip glob patterns — we can only watch real directories
+                let expanded_str = expanded.to_string_lossy();
+                if expanded_str.contains('*')
+                    || expanded_str.contains('?')
+                    || expanded_str.contains('[')
+                {
+                    continue;
+                }
+                watch_paths.push(expanded);
+            }
+
+            // Bridge notify → async via mpsc channel
+            let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel::<notify::Event>(256);
+
+            // Create the notify watcher
+            let watcher_result =
+                notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+                    if let Ok(event) = res {
+                        let _ = notify_tx.blocking_send(event);
+                    }
+                });
+
+            let mut watcher = match watcher_result {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::warn!("Failed to create filesystem watcher: {}", e);
+                    return Ok(());
+                }
+            };
+
+            // Register paths with the watcher
+            use notify::Watcher;
+            for path in &watch_paths {
+                if path.exists() {
+                    if let Err(e) = watcher.watch(path, notify::RecursiveMode::Recursive) {
+                        tracing::warn!("Failed to watch {}: {}", path.display(), e);
+                    } else {
+                        tracing::info!("FS Guard watching: {}", path.display());
+                    }
+                } else {
+                    tracing::warn!(
+                        "FS Guard: path does not exist, skipping: {}",
+                        path.display()
+                    );
+                }
+            }
+
+            let cancel = self.cancel_token.clone();
+            let app_config = Arc::clone(&self.app_config);
+            let events_total = Arc::clone(&self.events_total);
+            let events_blocked = Arc::clone(&self.events_blocked);
+            let last_activity = Arc::clone(&self.last_activity);
+
+            let handle = tokio::spawn(async move {
+                // Keep watcher alive for the duration of the task
+                let _watcher = watcher;
+
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
+                            tracing::info!("FS Guard watcher shutting down");
+                            break;
+                        }
+                        event = notify_rx.recv() => {
+                            let event = match event {
+                                Some(e) => e,
+                                None => break, // Channel closed
+                            };
+
+                            // Update watchdog
+                            if let Ok(mut ts) = last_activity.lock() {
+                                *ts = Some(std::time::Instant::now());
+                            }
+
+                            // Determine if this is a write-type event
+                            let is_write = matches!(
+                                event.kind,
+                                notify::EventKind::Create(_)
+                                    | notify::EventKind::Modify(_)
+                                    | notify::EventKind::Remove(_)
+                            );
+
+                            // Get current mode
+                            let mode = app_config
+                                .read()
+                                .ok()
+                                .map(|cfg| match cfg.general.mode.as_str() {
+                                    "enforce" => crate::types::OperationMode::Enforce,
+                                    "paranoid" => crate::types::OperationMode::Paranoid,
+                                    _ => crate::types::OperationMode::Monitor,
+                                })
+                                .unwrap_or(crate::types::OperationMode::Monitor);
+
+                            // Check each affected path
+                            for path in &event.paths {
+                                let verdict = matcher.check(path, &mode);
+
+                                events_total.fetch_add(1, Ordering::SeqCst);
+
+                                match verdict {
+                                    PathVerdict::Blocked => {
+                                        events_blocked.fetch_add(1, Ordering::SeqCst);
+                                        let event_kind = format!("{:?}", event.kind);
+                                        let se = FsGuard::create_blocked_event(path, &event_kind);
+                                        let _ = alert_tx.try_send(se);
+                                    }
+                                    PathVerdict::ReadOnly if is_write => {
+                                        events_blocked.fetch_add(1, Ordering::SeqCst);
+                                        let event_kind = format!("{:?}", event.kind);
+                                        let se = FsGuard::create_read_only_event(path, &event_kind);
+                                        let _ = alert_tx.try_send(se);
+                                    }
+                                    _ => {
+                                        // Allowed or Unmatched or ReadOnly+Read → ignore
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            *self.task_handle.lock().await = Some(handle);
         }
 
         Ok(())
@@ -513,6 +650,10 @@ impl Guard for FsGuard {
 
     async fn stop(&self) -> anyhow::Result<()> {
         self.running.store(false, Ordering::SeqCst);
+        self.cancel_token.cancel();
+        if let Some(handle) = self.task_handle.lock().await.take() {
+            let _ = handle.await;
+        }
         Ok(())
     }
 
