@@ -188,6 +188,12 @@ dashboard:
   port: 9999
 "##;
 
+/// Trouve un port TCP libre en bindant sur le port 0.
+pub fn find_free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind to port 0");
+    listener.local_addr().unwrap().port()
+}
+
 /// Config avec des valeurs invalides — pour tester la validation.
 pub fn invalid_config() -> &'static str {
     r##"

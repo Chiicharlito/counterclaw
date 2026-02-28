@@ -312,6 +312,25 @@ impl AppConfig {
     pub fn events_log_path(&self) -> PathBuf {
         expand_tilde(&self.alerting.file_log.path)
     }
+
+    /// Sauvegarde la configuration dans un fichier YAML.
+    pub fn save(&self, path: &Path) -> Result<(), CounterClawError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                CounterClawError::Config(format!(
+                    "Cannot create directory {}: {}",
+                    parent.display(),
+                    e
+                ))
+            })?;
+        }
+        let yaml = serde_yaml::to_string(self)
+            .map_err(|e| CounterClawError::Config(format!("Failed to serialize config: {}", e)))?;
+        std::fs::write(path, yaml).map_err(|e| {
+            CounterClawError::Config(format!("Cannot write config to {}: {}", path.display(), e))
+        })?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

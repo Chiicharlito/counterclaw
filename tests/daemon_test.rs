@@ -6,6 +6,7 @@ use counterclaw::config::AppConfig;
 use counterclaw::daemon::{read_pid_file, remove_pid_file, write_pid_file, Daemon, DaemonState};
 use counterclaw::types::{EventBuffer, GuardModule};
 use std::fs;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 // ---------------------------------------------------------------------------
@@ -190,4 +191,101 @@ fn daemon_state_mode_from_config() {
         "monitor",
         "Should reflect config mode"
     );
+}
+
+// ---------------------------------------------------------------------------
+// run_until_signal wiring tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn run_until_signal_writes_pid_file() {
+    let env = common::TestEnv::new();
+    let config = load_config(&env);
+    let pid_path = PathBuf::from(&config.general.pid_file);
+    let buffer = Arc::new(RwLock::new(EventBuffer::new(100)));
+
+    let daemon = Daemon::new(config, buffer);
+
+    let handle = tokio::spawn(async move {
+        daemon.run_until_signal().await;
+    });
+
+    // Give it a moment to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    // PID file should exist and contain our PID
+    assert!(pid_path.exists(), "PID file should be written at startup");
+    let pid = read_pid_file(&pid_path);
+    assert!(pid.is_some(), "PID file should contain a valid PID");
+    assert_eq!(
+        pid.unwrap(),
+        std::process::id(),
+        "PID should match current process"
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn run_until_signal_expands_tilde_in_pid_path() {
+    let env = common::TestEnv::new();
+    let mut config = load_config(&env);
+
+    // Create a unique test dir under ~ to verify tilde expansion
+    let test_dir_name = format!(".counterclaw_test_{}", std::process::id());
+    let home = dirs::home_dir().expect("home dir");
+    let real_dir = home.join(&test_dir_name);
+    std::fs::create_dir_all(&real_dir).unwrap();
+
+    // Use a ~/... path — daemon must expand the tilde
+    config.general.pid_file = format!("~/{}/test.pid", test_dir_name);
+    let expected_path = real_dir.join("test.pid");
+
+    let buffer = Arc::new(RwLock::new(EventBuffer::new(100)));
+    let daemon = Daemon::new(config, buffer);
+
+    let handle = tokio::spawn(async move {
+        daemon.run_until_signal().await;
+    });
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    // PID file should be at the expanded path, not a literal "~" directory
+    assert!(
+        expected_path.exists(),
+        "PID file should be written at expanded tilde path: {}",
+        expected_path.display()
+    );
+
+    handle.abort();
+
+    // Cleanup
+    let _ = std::fs::remove_dir_all(&real_dir);
+}
+
+#[tokio::test]
+async fn run_until_signal_starts_dashboard() {
+    let env = common::TestEnv::new();
+    let mut config = load_config(&env);
+    let port = common::find_free_port();
+    config.dashboard.enabled = true;
+    config.dashboard.port = port;
+
+    let buffer = Arc::new(RwLock::new(EventBuffer::new(100)));
+    let daemon = Daemon::new(config, buffer);
+
+    let handle = tokio::spawn(async move {
+        daemon.run_until_signal().await;
+    });
+
+    // Give it time to bind the dashboard server
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    // Dashboard /api/health should be reachable
+    let resp = reqwest::get(format!("http://127.0.0.1:{}/api/health", port))
+        .await
+        .expect("Dashboard should be reachable");
+    assert_eq!(resp.status(), 200);
+
+    handle.abort();
 }
