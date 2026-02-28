@@ -10,6 +10,9 @@
 use clap::{Parser, Subcommand};
 use counterclaw::alerting::engine::AlertingEngine;
 use counterclaw::config::{self, default_config_path, expand_tilde};
+use counterclaw::guards::cdp_proxy::DomainMatcher;
+use counterclaw::guards::cmd_guard::{CommandMatcher, MatchType};
+use counterclaw::guards::fs_guard::{PathMatcher, PathVerdict};
 use counterclaw::types::{ActionTaken, GuardModule, SecurityEvent, Severity};
 use tokio::sync::mpsc;
 
@@ -64,6 +67,9 @@ pub enum Commands {
 
     /// Test rules against specific inputs
     Test {
+        /// Path to config file
+        #[arg(short, long)]
+        config: Option<String>,
         #[command(subcommand)]
         target: TestTarget,
     },
@@ -124,9 +130,7 @@ async fn main() {
         Commands::Logs { .. } => {
             println!("Logs command will be available in a future version.");
         }
-        Commands::Test { .. } => {
-            println!("Test command will be available in a future version.");
-        }
+        Commands::Test { config, target } => cmd_test(config, target),
         Commands::Dashboard => {
             println!("Dashboard will be available in a future version.");
         }
@@ -165,6 +169,88 @@ fn cmd_config(action: ConfigAction) {
                 Err(e) => {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Commande : test — teste une regle contre un input specifique
+// ---------------------------------------------------------------------------
+
+/// Charge la config et teste un chemin, domaine ou commande contre les regles.
+/// Exit code 0 = autorise, exit code 1 = bloque.
+fn cmd_test(config_path: Option<String>, target: TestTarget) {
+    // Charger la config (meme pattern que cmd_config Check)
+    let path = config_path
+        .map(|p| expand_tilde(&p))
+        .unwrap_or_else(default_config_path);
+
+    let app_config = match config::check_config(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    match target {
+        TestTarget::Path { path: test_path } => {
+            let matcher = PathMatcher::new(
+                app_config.fs_guard.blocked_paths.clone(),
+                app_config.fs_guard.read_only_paths.clone(),
+                app_config.fs_guard.allowed_paths.clone(),
+            );
+            let expanded = expand_tilde(&test_path);
+            let verdict = matcher.check(&expanded);
+            match verdict {
+                PathVerdict::Blocked => {
+                    println!("BLOCKED — path is in blocked_paths");
+                    std::process::exit(1);
+                }
+                PathVerdict::ReadOnly => {
+                    println!("READ_ONLY — path is in read_only_paths (writes blocked)");
+                    std::process::exit(1);
+                }
+                PathVerdict::Allowed => {
+                    println!("ALLOWED — path is explicitly allowed");
+                }
+                PathVerdict::Unmatched => {
+                    println!("UNMATCHED — path not covered by any rule");
+                }
+            }
+        }
+        TestTarget::Domain { domain } => {
+            let matcher = DomainMatcher::new(&app_config.cdp_proxy.domains);
+            let verdict = matcher.check(&domain);
+            match verdict {
+                counterclaw::guards::cdp_proxy::DomainVerdict::Blocked => {
+                    println!("BLOCKED — domain is in blocked list");
+                    std::process::exit(1);
+                }
+                counterclaw::guards::cdp_proxy::DomainVerdict::RequireApproval => {
+                    println!("REQUIRE_APPROVAL — domain needs approval");
+                }
+                counterclaw::guards::cdp_proxy::DomainVerdict::Allowed => {
+                    println!("ALLOWED — domain is permitted");
+                }
+            }
+        }
+        TestTarget::Command { command } => {
+            let matcher = CommandMatcher::new(&app_config.cmd_guard);
+            match matcher.match_command(&command) {
+                Some(verdict) => match verdict.match_type {
+                    MatchType::Blacklisted => {
+                        println!("BLOCKED [{}] — {}", verdict.severity, verdict.description);
+                        std::process::exit(1);
+                    }
+                    MatchType::RequiresApproval => {
+                        println!("REQUIRE_APPROVAL — {}", verdict.description);
+                    }
+                },
+                None => {
+                    println!("ALLOWED — command matches no rules");
                 }
             }
         }
