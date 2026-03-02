@@ -153,3 +153,112 @@ async fn polling_increments_counters_on_activity() {
 
     guard.stop().await.expect("stop failed");
 }
+
+// ===========================================================================
+// Issue 2 : build_lsof_args — ciblage par PID
+// ===========================================================================
+
+use counterclaw::guards::net_guard::build_lsof_args;
+
+/// build_lsof_args avec PIDs produit "-p pid1,pid2 -i -n -P".
+#[test]
+fn build_lsof_args_with_pids_targets_specific_processes() {
+    let args = build_lsof_args(&[1234, 5678]);
+    assert_eq!(args, vec!["-p", "1234,5678", "-i", "-n", "-P"]);
+}
+
+/// build_lsof_args sans PIDs produit le fallback global "-i -n -P".
+#[test]
+fn build_lsof_args_without_pids_uses_global_scan() {
+    let args = build_lsof_args(&[]);
+    assert_eq!(args, vec!["-i", "-n", "-P"]);
+}
+
+/// build_lsof_args avec un seul PID produit "-p 1234 -i -n -P".
+#[test]
+fn build_lsof_args_single_pid() {
+    let args = build_lsof_args(&[1234]);
+    assert_eq!(args, vec!["-p", "1234", "-i", "-n", "-P"]);
+}
+
+/// build_lsof_args avec plusieurs PIDs les sépare par virgule.
+#[test]
+fn build_lsof_args_multiple_pids() {
+    let args = build_lsof_args(&[1234, 5678, 9012]);
+    assert_eq!(args, vec!["-p", "1234,5678,9012", "-i", "-n", "-P"]);
+}
+
+/// NetGuard n'exécute pas lsof en état Idle (pas de processus surveillé).
+/// Vérifié indirectement : avec watch_processes et aucun processus actif,
+/// le guard devrait rester au repos (0 events total).
+#[tokio::test]
+async fn net_guard_skips_lsof_in_idle_state() {
+    // Config with watch_processes set to nonexistent pattern
+    let yaml = r#"
+enabled: true
+watch_processes:
+    - "zzz_nonexistent_process_xyz_42"
+allowed_egress: []
+max_post_payload_bytes: 10485760
+block_unknown_post: false
+alert_on_unknown_dns: false
+enforcement_method: log_only
+poll_interval_ms: 1000
+idle_poll_interval_ms: 30000
+"#;
+    let config: counterclaw::config::NetGuardConfig =
+        serde_yaml::from_str(yaml).expect("valid config");
+    let guard = NetGuard::new(&config, common::test_app_config_arc());
+    let (tx, _rx) = mpsc::channel::<SecurityEvent>(64);
+
+    guard.start(tx).await.expect("start failed");
+
+    // Wait for a few seconds — poller should be in Idle (30s interval),
+    // so no lsof should be executed and events_total should remain 0
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    let status = guard.status();
+    assert_eq!(
+        status.events_total, 0,
+        "No events should fire when in Idle state (no watched process active)"
+    );
+
+    guard.stop().await.expect("stop failed");
+}
+
+/// NetGuard utilise lsof ciblé quand des PIDs surveillés sont actifs.
+/// Vérifié indirectement : le guard continue de fonctionner sans crash
+/// avec watch_processes configuré sur un processus système existant.
+#[tokio::test]
+async fn net_guard_uses_targeted_lsof_in_active_state() {
+    // Config with watch_processes matching a system process (always running)
+    let yaml = r#"
+enabled: true
+watch_processes:
+    - "launchd|init|systemd"
+allowed_egress: []
+max_post_payload_bytes: 10485760
+block_unknown_post: false
+alert_on_unknown_dns: false
+enforcement_method: log_only
+poll_interval_ms: 1000
+idle_poll_interval_ms: 30000
+"#;
+    let config: counterclaw::config::NetGuardConfig =
+        serde_yaml::from_str(yaml).expect("valid config");
+    let guard = NetGuard::new(&config, common::test_app_config_arc());
+    let (tx, _rx) = mpsc::channel::<SecurityEvent>(64);
+
+    guard.start(tx).await.expect("start failed");
+
+    // Wait for a couple of active polling cycles
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+
+    let status = guard.status();
+    assert!(
+        status.running,
+        "Guard should still be running with targeted lsof"
+    );
+
+    guard.stop().await.expect("stop failed");
+}

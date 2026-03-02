@@ -141,11 +141,19 @@ pub struct NetGuardConfig {
     /// Polling interval in milliseconds for lsof. Default: 3000ms.
     #[serde(default = "default_net_poll_interval_ms")]
     pub poll_interval_ms: u64,
+    /// Slow polling interval when no watched processes are active. Default: 30000ms.
+    #[serde(default = "default_idle_poll_interval_ms")]
+    pub idle_poll_interval_ms: u64,
 }
 
 /// Default polling interval for cmd_guard (500ms).
 fn default_cmd_poll_interval_ms() -> u64 {
     500
+}
+
+/// Default idle polling interval (30000ms = 30s).
+fn default_idle_poll_interval_ms() -> u64 {
+    30000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,6 +165,13 @@ pub struct CmdGuardConfig {
     /// Polling interval in milliseconds for process scanning. Default: 500ms.
     #[serde(default = "default_cmd_poll_interval_ms")]
     pub poll_interval_ms: u64,
+    /// Process patterns to watch for adaptive polling. When no watched process
+    /// is running, polling slows to idle_poll_interval_ms. Default: empty (poll always).
+    #[serde(default)]
+    pub watch_processes: Vec<String>,
+    /// Slow polling interval when no watched processes are active. Default: 30000ms.
+    #[serde(default = "default_idle_poll_interval_ms")]
+    pub idle_poll_interval_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -173,6 +173,52 @@ impl ProcessScanner {
             .filter(|p| matches_process_patterns(&p.name, &p.cmd, patterns))
             .collect()
     }
+
+    /// Vérifie si au moins un processus actif matche les patterns surveillés.
+    /// Effectue un refresh avant de scanner.
+    /// Sur macOS, utilise le nom comme fallback quand cmd() est vide.
+    pub fn has_watched_processes(&mut self, patterns: &[String]) -> bool {
+        self.refresh();
+        self.system.processes().values().any(|proc| {
+            let name = proc.name().to_string_lossy().to_string();
+            let cmd = proc
+                .cmd()
+                .iter()
+                .map(|s| s.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" ");
+            // macOS fallback: when cmd is empty, use name as the check string
+            let check_str = if cmd.trim().is_empty() { &name } else { &cmd };
+            matches_process_patterns(&name, check_str, patterns)
+        })
+    }
+
+    /// Retourne les PIDs des processus qui matchent les patterns surveillés.
+    /// Effectue un refresh avant de scanner.
+    /// Sur macOS, utilise le nom comme fallback quand cmd() est vide.
+    pub fn find_watched_pids(&mut self, patterns: &[String]) -> Vec<u32> {
+        self.refresh();
+        self.system
+            .processes()
+            .iter()
+            .filter_map(|(pid, proc)| {
+                let name = proc.name().to_string_lossy().to_string();
+                let cmd = proc
+                    .cmd()
+                    .iter()
+                    .map(|s| s.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                // macOS fallback: when cmd is empty, use name as the check string
+                let check_str = if cmd.trim().is_empty() { &name } else { &cmd };
+                if matches_process_patterns(&name, check_str, patterns) {
+                    Some(pid.as_u32())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------

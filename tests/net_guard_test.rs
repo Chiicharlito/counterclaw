@@ -40,6 +40,7 @@ fn config_with_standard_allowed() -> NetGuardConfig {
         alert_on_unknown_dns: true,
         enforcement_method: "log_only".to_string(),
         poll_interval_ms: 3000,
+        idle_poll_interval_ms: 30000,
     }
 }
 
@@ -53,6 +54,7 @@ fn config_empty_allowed() -> NetGuardConfig {
         alert_on_unknown_dns: false,
         enforcement_method: "log_only".to_string(),
         poll_interval_ms: 3000,
+        idle_poll_interval_ms: 30000,
     }
 }
 
