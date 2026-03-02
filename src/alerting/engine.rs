@@ -17,6 +17,34 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::sync::mpsc;
 
+/// Checks if a kill switch action string should trigger process killing.
+///
+/// Returns true for "kill" and "suspend_openclaw" actions.
+/// Returns false for "alert_only" or any unknown action.
+pub fn kill_switch_should_kill(action: &str) -> bool {
+    matches!(action, "kill" | "suspend_openclaw")
+}
+
+/// Checks if a SecurityEvent should be excluded from kill switch event counting.
+///
+/// Only FsGuard events can be excluded (system noise filtering).
+/// Returns true if the event's description contains any of the exclude patterns.
+pub fn should_exclude_from_kill_switch(event: &SecurityEvent, exclude_patterns: &[String]) -> bool {
+    // Only exclude FsGuard events (system noise is filesystem-specific)
+    if event.module != GuardModule::FsGuard {
+        return false;
+    }
+
+    // Check if description matches any exclude pattern
+    for pattern in exclude_patterns {
+        if event.description.contains(pattern.as_str()) {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Per-module rate limiter for the alerting engine.
 /// Implements a sliding window of max_per_second events per module.
 struct ModuleRateLimiter {
@@ -158,6 +186,10 @@ struct KillSwitch {
     threshold_count: usize,
     threshold_window_seconds: u64,
     action: String,
+    /// Process patterns to kill when triggered.
+    watch_processes: Vec<String>,
+    /// Path patterns to exclude from event counting (e.g., Keychain noise).
+    exclude_path_patterns: Vec<String>,
     /// V9: Monotonic timestamps for violation window tracking.
     /// Using Instant instead of DateTime<Utc> to prevent clock manipulation attacks.
     recent_violations: VecDeque<Instant>,
@@ -180,6 +212,8 @@ impl KillSwitch {
             threshold_count: config.threshold_count as usize,
             threshold_window_seconds: config.threshold_window_seconds,
             action: config.action.clone(),
+            watch_processes: config.watch_processes.clone(),
+            exclude_path_patterns: config.exclude_path_patterns.clone(),
             recent_violations: VecDeque::new(),
             triggered: false,
         }
@@ -188,8 +222,14 @@ impl KillSwitch {
     /// Enregistre un événement dans la fenêtre glissante.
     /// V9: Uses Instant (monotonic clock) instead of Utc::now() to prevent
     /// clock manipulation attacks where an attacker sets the system time back.
+    /// BUG 5: Events matching exclude_path_patterns are not counted (noise filtering).
     fn record_event(&mut self, event: &SecurityEvent) {
         if !self.enabled || event.severity < self.threshold_severity {
+            return;
+        }
+
+        // BUG 5: Skip events matching exclude patterns (e.g., Keychain noise)
+        if should_exclude_from_kill_switch(event, &self.exclude_path_patterns) {
             return;
         }
 
@@ -234,17 +274,67 @@ impl KillSwitch {
     }
 
     /// Exécute l'action du kill switch.
-    /// En MVP : log + notification. Le vrai kill de process viendra en Phase 2.
+    ///
+    /// Si `action` est "kill" ou "suspend_openclaw" et `watch_processes` est non-vide,
+    /// tente de tuer les processus correspondants via ProcessScanner + kill_process().
+    /// Sinon, log + notification seulement.
+    ///
     /// Returns the kill switch SecurityEvent for buffer storage.
     fn execute(&mut self, logger: &EventLogger, notifier: &MacosNotifier) -> SecurityEvent {
         self.triggered = true;
 
-        let description = format!(
+        let mut description = format!(
             "Kill switch triggered: {} violations in {}s window (action: {})",
             self.recent_violations.len(),
             self.threshold_window_seconds,
             self.action
         );
+
+        // Attempt actual process killing if configured
+        if kill_switch_should_kill(&self.action) && !self.watch_processes.is_empty() {
+            let scanner = crate::process::ProcessScanner::new();
+            let targets = scanner.find_matching(&self.watch_processes);
+
+            if targets.is_empty() {
+                tracing::warn!(
+                    "Kill switch: no matching processes found for patterns: {:?}",
+                    self.watch_processes
+                );
+                description.push_str(" — no matching processes found");
+            } else {
+                let mut killed_pids = Vec::new();
+                for target in &targets {
+                    match crate::process::kill_process(target.pid) {
+                        Ok(true) => {
+                            tracing::error!(
+                                "Kill switch: killed process {} (pid {})",
+                                target.name,
+                                target.pid
+                            );
+                            killed_pids.push(target.pid);
+                        }
+                        Ok(false) => {
+                            tracing::warn!(
+                                "Kill switch: process {} (pid {}) not found",
+                                target.name,
+                                target.pid
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Kill switch: failed to kill process {} (pid {}): {}",
+                                target.name,
+                                target.pid,
+                                e
+                            );
+                        }
+                    }
+                }
+                if !killed_pids.is_empty() {
+                    description.push_str(&format!(" — killed PIDs: {:?}", killed_pids));
+                }
+            }
+        }
 
         tracing::error!("{}", description);
 

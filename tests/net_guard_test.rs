@@ -39,6 +39,7 @@ fn config_with_standard_allowed() -> NetGuardConfig {
         block_unknown_post: true,
         alert_on_unknown_dns: true,
         enforcement_method: "log_only".to_string(),
+        poll_interval_ms: 3000,
     }
 }
 
@@ -51,6 +52,7 @@ fn config_empty_allowed() -> NetGuardConfig {
         block_unknown_post: false,
         alert_on_unknown_dns: false,
         enforcement_method: "log_only".to_string(),
+        poll_interval_ms: 3000,
     }
 }
 

@@ -164,6 +164,7 @@ fn test_cmd_unmatched_monitor_allows() {
         }],
         require_approval: vec![],
         monitoring_method: "log_only".to_string(),
+        poll_interval_ms: 500,
     };
     let matcher = CommandMatcher::new(&config);
     // Une commande non-matchée en monitor → None (pas de verdict = autorisé)
@@ -182,6 +183,7 @@ fn test_cmd_unmatched_enforce_allows() {
         }],
         require_approval: vec![],
         monitoring_method: "log_only".to_string(),
+        poll_interval_ms: 500,
     };
     let matcher = CommandMatcher::new(&config);
     let verdict = matcher.match_command("ls -la", &OperationMode::Enforce);
@@ -199,6 +201,7 @@ fn test_cmd_unmatched_paranoid_blocks() {
         }],
         require_approval: vec![],
         monitoring_method: "log_only".to_string(),
+        poll_interval_ms: 500,
     };
     let matcher = CommandMatcher::new(&config);
     // En paranoid, une commande non-matchée → Some(verdict) avec Blocked
