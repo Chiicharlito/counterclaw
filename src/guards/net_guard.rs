@@ -6,6 +6,7 @@
 //! 3. **NetGuard** (Guard trait) : polling lsof → détection → mpsc
 
 use crate::config::{AppConfig, NetGuardConfig};
+use crate::guards::adaptive_poller::AdaptivePoller;
 use crate::types::{Guard, GuardStatus, SecurityEvent};
 use chrono::{Duration, Utc};
 use std::collections::{HashMap, HashSet};
@@ -269,6 +270,33 @@ impl ConnectionParser {
 }
 
 // ---------------------------------------------------------------------------
+// build_lsof_args — ciblage par PID pour réduire la latence
+// ---------------------------------------------------------------------------
+
+/// Construit les arguments lsof en ciblant les PIDs spécifiques si disponibles.
+///
+/// Avec PIDs : `lsof -p pid1,pid2 -i -n -P` (~5-10ms)
+/// Sans PIDs : `lsof -i -n -P` (fallback global, ~500ms)
+pub fn build_lsof_args(pids: &[u32]) -> Vec<String> {
+    if pids.is_empty() {
+        vec!["-i".to_string(), "-n".to_string(), "-P".to_string()]
+    } else {
+        let pid_list = pids
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        vec![
+            "-p".to_string(),
+            pid_list,
+            "-i".to_string(),
+            "-n".to_string(),
+            "-P".to_string(),
+        ]
+    }
+}
+
+// ---------------------------------------------------------------------------
 // NetGuard — implémentation du Guard trait
 // ---------------------------------------------------------------------------
 
@@ -320,12 +348,19 @@ impl Guard for NetGuard {
             let watch_processes = self.config.watch_processes.clone();
             let events_total = Arc::clone(&self.events_total);
             let events_blocked = Arc::clone(&self.events_blocked);
-            let poll_interval = std::time::Duration::from_millis(self.config.poll_interval_ms);
+            let active_interval = std::time::Duration::from_millis(self.config.poll_interval_ms);
+            let idle_interval = std::time::Duration::from_millis(self.config.idle_poll_interval_ms);
 
             let handle = tokio::spawn(async move {
                 let mut seen_connections: HashSet<(u32, String, u16)> = HashSet::new();
                 let mut dns_cache = DnsCache::new();
                 let mut process_scanner = crate::process::ProcessScanner::new();
+                let mut poller = AdaptivePoller::with_intervals(
+                    idle_interval,
+                    active_interval,
+                    std::time::Duration::from_secs(5),
+                    3,
+                );
 
                 loop {
                     tokio::select! {
@@ -333,10 +368,30 @@ impl Guard for NetGuard {
                             tracing::info!("Net Guard polling shutting down");
                             break;
                         }
-                        _ = tokio::time::sleep(poll_interval) => {
-                            // Run lsof -i -n -P
+                        _ = tokio::time::sleep(if watch_processes.is_empty() {
+                            active_interval
+                        } else {
+                            poller.current_interval()
+                        }) => {
+                            // Adaptive polling: check if watched processes are active
+                            let watched_pids = if !watch_processes.is_empty() {
+                                let pids = process_scanner.find_watched_pids(&watch_processes);
+                                let watched_found = !pids.is_empty();
+                                poller.transition(watched_found);
+                                if matches!(poller.state(), crate::guards::adaptive_poller::PollerState::Idle) {
+                                    continue; // Skip lsof in Idle state
+                                }
+                                pids
+                            } else {
+                                vec![] // No filter — scan all
+                            };
+
+                            // Build targeted lsof args
+                            let lsof_args = build_lsof_args(&watched_pids);
+
+                            // Run lsof with targeted or global args
                             let output = match tokio::process::Command::new("lsof")
-                                .args(["-i", "-n", "-P"])
+                                .args(&lsof_args)
                                 .output()
                                 .await
                             {

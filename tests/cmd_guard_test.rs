@@ -74,6 +74,8 @@ fn config_with_standard_blacklist() -> CmdGuardConfig {
         ],
         monitoring_method: "log_only".to_string(),
         poll_interval_ms: 500,
+        watch_processes: vec![],
+        idle_poll_interval_ms: 30000,
     }
 }
 
@@ -85,6 +87,8 @@ fn config_empty() -> CmdGuardConfig {
         require_approval: vec![],
         monitoring_method: "log_only".to_string(),
         poll_interval_ms: 500,
+        watch_processes: vec![],
+        idle_poll_interval_ms: 30000,
     }
 }
 
@@ -308,6 +312,8 @@ fn blacklist_checked_before_approval() {
         }],
         monitoring_method: "log_only".to_string(),
         poll_interval_ms: 500,
+        watch_processes: vec![],
+        idle_poll_interval_ms: 30000,
     };
     let matcher = CommandMatcher::new(&config);
     let verdict = matcher

@@ -2,9 +2,14 @@
 //!
 //! Architecture en 2 couches :
 //! 1. **CommandMatcher** (logique pure) : commande + règles → verdict
-//! 2. **CmdGuard** (Guard trait) : polling processus → détection → mpsc
+//! 2. **CmdGuard** (Guard trait) : détection processus → verdict → mpsc
+//!
+//! Sur macOS, utilise KqueueMonitor pour la détection en temps réel (kqueue EVFILT_PROC).
+//! Sur Linux, utilise le polling ProcessScanner avec AdaptivePoller.
 
 use crate::config::{AppConfig, CmdGuardConfig};
+#[cfg(not(target_os = "macos"))]
+use crate::guards::adaptive_poller::AdaptivePoller;
 use crate::types::{Guard, GuardStatus, SecurityEvent, Severity};
 use chrono::{Duration, Utc};
 use regex::Regex;
@@ -212,6 +217,94 @@ impl CommandMatcher {
 }
 
 // ---------------------------------------------------------------------------
+// Shared helpers for command verdict processing
+// ---------------------------------------------------------------------------
+
+/// Read current operation mode from shared config.
+fn read_mode(app_config: &RwLock<AppConfig>) -> crate::types::OperationMode {
+    app_config
+        .read()
+        .ok()
+        .map(|cfg| match cfg.general.mode.as_str() {
+            "enforce" => crate::types::OperationMode::Enforce,
+            "paranoid" => crate::types::OperationMode::Paranoid,
+            _ => crate::types::OperationMode::Monitor,
+        })
+        .unwrap_or(crate::types::OperationMode::Monitor)
+}
+
+/// Shared context for command verdict processing (avoids too many function parameters).
+struct VerdictContext<'a> {
+    matcher: &'a CommandMatcher,
+    events_total: &'a AtomicU64,
+    events_blocked: &'a AtomicU64,
+    alert_tx: &'a mpsc::Sender<SecurityEvent>,
+}
+
+/// Process a detected command through CommandMatcher and emit SecurityEvent if matched.
+fn process_command_verdict(
+    pid: u32,
+    name: &str,
+    cmd_str: &str,
+    mode: &crate::types::OperationMode,
+    seen_pids: &mut HashSet<u32>,
+    ctx: &VerdictContext<'_>,
+) {
+    if seen_pids.contains(&pid) {
+        return;
+    }
+
+    // V10: argv[0] mismatch detection
+    if crate::process::check_argv0_mismatch(name, cmd_str) {
+        tracing::warn!(
+            "argv[0] mismatch: name='{}' cmd='{}' pid={}",
+            name,
+            cmd_str,
+            pid
+        );
+    }
+
+    let check_str = if cmd_str.trim().is_empty() {
+        name
+    } else {
+        cmd_str
+    };
+
+    if let Some(verdict) = ctx.matcher.match_command(check_str, mode) {
+        seen_pids.insert(pid);
+        ctx.events_total.fetch_add(1, Ordering::SeqCst);
+
+        match verdict.match_type {
+            MatchType::Blacklisted => {
+                ctx.events_blocked.fetch_add(1, Ordering::SeqCst);
+                let event = SecurityEvent::new(
+                    crate::types::GuardModule::CmdGuard,
+                    verdict.severity,
+                    crate::types::ActionTaken::Blocked,
+                    format!(
+                        "Blacklisted command detected (pid {}): {}",
+                        pid, verdict.description
+                    ),
+                );
+                let _ = ctx.alert_tx.try_send(event);
+            }
+            MatchType::RequiresApproval => {
+                let event = SecurityEvent::new(
+                    crate::types::GuardModule::CmdGuard,
+                    Severity::Warning,
+                    crate::types::ActionTaken::Alerted,
+                    format!(
+                        "Command requires approval (pid {}): {}",
+                        pid, verdict.description
+                    ),
+                );
+                let _ = ctx.alert_tx.try_send(event);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CmdGuard — implémentation du Guard trait
 // ---------------------------------------------------------------------------
 
@@ -261,99 +354,174 @@ impl Guard for CmdGuard {
             let app_config = Arc::clone(&self.app_config);
             let events_total = Arc::clone(&self.events_total);
             let events_blocked = Arc::clone(&self.events_blocked);
-            let poll_interval = std::time::Duration::from_millis(self.config.poll_interval_ms);
 
-            let handle = tokio::spawn(async move {
-                let mut scanner = crate::process::ProcessScanner::new();
-                let mut seen_pids: HashSet<u32> = HashSet::new();
+            // macOS: KqueueMonitor for real-time process detection via kqueue EVFILT_PROC.
+            // Detects processes matching blacklist/approval patterns (including ephemeral <50ms).
+            #[cfg(target_os = "macos")]
+            let handle = {
+                use crate::guards::kqueue_monitor::KqueueMonitor;
+                use crate::guards::process_monitor::{DetectedProcess, ProcessMonitor};
 
-                loop {
-                    tokio::select! {
-                        _ = cancel.cancelled() => {
-                            tracing::info!("Cmd Guard polling shutting down");
-                            break;
+                // Build watch patterns from blacklist + approval rules
+                let mut watch_patterns: Vec<String> = self
+                    .config
+                    .blacklist
+                    .iter()
+                    .map(|p| p.pattern.clone())
+                    .collect();
+                watch_patterns.extend(
+                    self.config
+                        .require_approval
+                        .iter()
+                        .map(|p| p.pattern.clone()),
+                );
+                // In Paranoid mode, catch ALL commands (default:deny)
+                if read_mode(&self.app_config) == crate::types::OperationMode::Paranoid {
+                    watch_patterns.push(".*".to_string());
+                }
+
+                let monitor = KqueueMonitor::new(watch_patterns);
+                let (proc_tx, mut proc_rx) = tokio::sync::mpsc::channel::<DetectedProcess>(256);
+                let cancel_monitor = cancel.clone();
+
+                tokio::spawn(async move {
+                    // Start kqueue monitor in a subtask (handles NEW processes only)
+                    let _monitor_task = tokio::spawn(async move {
+                        let _ = monitor.start(proc_tx, cancel_monitor).await;
+                    });
+
+                    let mut seen_pids: HashSet<u32> = HashSet::new();
+                    let ctx = VerdictContext {
+                        matcher: &matcher,
+                        events_total: &events_total,
+                        events_blocked: &events_blocked,
+                        alert_tx: &alert_tx,
+                    };
+
+                    // Initial scan: detect EXISTING processes (one-time).
+                    // KqueueMonitor only catches new fork/exec events, so we need
+                    // this scan to find already-running processes at startup.
+                    {
+                        let mut scanner = crate::process::ProcessScanner::new();
+                        scanner.refresh();
+                        let all_procs = scanner.scan_all();
+                        let mode = read_mode(&app_config);
+                        for proc in &all_procs {
+                            process_command_verdict(
+                                proc.pid,
+                                &proc.name,
+                                &proc.cmd,
+                                &mode,
+                                &mut seen_pids,
+                                &ctx,
+                            );
                         }
-                        _ = tokio::time::sleep(poll_interval) => {
-                            scanner.refresh();
-                            let all_procs = scanner.scan_all();
+                    }
 
-                            // Get current mode
-                            let mode = app_config
-                                .read()
-                                .ok()
-                                .map(|cfg| match cfg.general.mode.as_str() {
-                                    "enforce" => crate::types::OperationMode::Enforce,
-                                    "paranoid" => crate::types::OperationMode::Paranoid,
-                                    _ => crate::types::OperationMode::Monitor,
-                                })
-                                .unwrap_or(crate::types::OperationMode::Monitor);
-
-                            // Prune dead PIDs (no longer in process list)
-                            let active_pids: HashSet<u32> =
-                                all_procs.iter().map(|p| p.pid).collect();
-                            seen_pids.retain(|pid| active_pids.contains(pid));
-
-                            for proc in &all_procs {
-                                // Skip already-seen PIDs
-                                if seen_pids.contains(&proc.pid) {
-                                    continue;
-                                }
-
-                                // V10: argv[0] mismatch detection
-                                if crate::process::check_argv0_mismatch(&proc.name, &proc.cmd) {
-                                    tracing::warn!(
-                                        "argv[0] mismatch: name='{}' cmd='{}' pid={}",
-                                        proc.name,
-                                        proc.cmd,
-                                        proc.pid
-                                    );
-                                }
-
-                                // Check command against matcher.
-                                // On macOS, sysinfo often returns empty cmd() for processes.
-                                // Fall back to checking proc.name if cmd is empty.
-                                let check_str = if proc.cmd.trim().is_empty() {
-                                    &proc.name
-                                } else {
-                                    &proc.cmd
-                                };
-                                if let Some(verdict) = matcher.match_command(check_str, &mode) {
-                                    seen_pids.insert(proc.pid);
-                                    events_total.fetch_add(1, Ordering::SeqCst);
-
-                                    match verdict.match_type {
-                                        MatchType::Blacklisted => {
-                                            events_blocked.fetch_add(1, Ordering::SeqCst);
-                                            let event = SecurityEvent::new(
-                                                crate::types::GuardModule::CmdGuard,
-                                                verdict.severity,
-                                                crate::types::ActionTaken::Blocked,
-                                                format!(
-                                                    "Blacklisted command detected (pid {}): {}",
-                                                    proc.pid, verdict.description
-                                                ),
-                                            );
-                                            let _ = alert_tx.try_send(event);
-                                        }
-                                        MatchType::RequiresApproval => {
-                                            let event = SecurityEvent::new(
-                                                crate::types::GuardModule::CmdGuard,
-                                                Severity::Warning,
-                                                crate::types::ActionTaken::Alerted,
-                                                format!(
-                                                    "Command requires approval (pid {}): {}",
-                                                    proc.pid, verdict.description
-                                                ),
-                                            );
-                                            let _ = alert_tx.try_send(event);
-                                        }
+                    // Then listen for kqueue detections (new processes)
+                    loop {
+                        tokio::select! {
+                            _ = cancel.cancelled() => {
+                                tracing::info!("Cmd Guard kqueue shutting down");
+                                break;
+                            }
+                            result = proc_rx.recv() => {
+                                match result {
+                                    Some(detected) => {
+                                        let cmd_str = detected.cmd.join(" ");
+                                        let mode = read_mode(&app_config);
+                                        process_command_verdict(
+                                            detected.pid,
+                                            &detected.name,
+                                            &cmd_str,
+                                            &mode,
+                                            &mut seen_pids,
+                                            &ctx,
+                                        );
                                     }
+                                    None => break,
                                 }
                             }
                         }
                     }
-                }
-            });
+                })
+            };
+
+            // Linux/fallback: polling with ProcessScanner + AdaptivePoller.
+            // Scans all processes at configurable interval (default 500ms).
+            #[cfg(not(target_os = "macos"))]
+            let handle = {
+                let watch_processes = self.config.watch_processes.clone();
+                let active_interval =
+                    std::time::Duration::from_millis(self.config.poll_interval_ms);
+                let idle_interval =
+                    std::time::Duration::from_millis(self.config.idle_poll_interval_ms);
+
+                tokio::spawn(async move {
+                    let mut scanner = crate::process::ProcessScanner::new();
+                    let mut seen_pids: HashSet<u32> = HashSet::new();
+                    let ctx = VerdictContext {
+                        matcher: &matcher,
+                        events_total: &events_total,
+                        events_blocked: &events_blocked,
+                        alert_tx: &alert_tx,
+                    };
+                    let mut poller = AdaptivePoller::with_intervals(
+                        idle_interval,
+                        active_interval,
+                        std::time::Duration::from_secs(5),
+                        3,
+                    );
+
+                    loop {
+                        tokio::select! {
+                            _ = cancel.cancelled() => {
+                                tracing::info!("Cmd Guard polling shutting down");
+                                break;
+                            }
+                            _ = tokio::time::sleep(if watch_processes.is_empty() {
+                                active_interval
+                            } else {
+                                poller.current_interval()
+                            }) => {
+                                // Adaptive polling: check if watched processes are active
+                                if !watch_processes.is_empty() {
+                                    let watched_found =
+                                        scanner.has_watched_processes(&watch_processes);
+                                    poller.transition(watched_found);
+                                    if matches!(
+                                        poller.state(),
+                                        crate::guards::adaptive_poller::PollerState::Idle
+                                    ) {
+                                        continue;
+                                    }
+                                }
+
+                                scanner.refresh();
+                                let all_procs = scanner.scan_all();
+
+                                let mode = read_mode(&app_config);
+
+                                // Prune dead PIDs
+                                let active_pids: HashSet<u32> =
+                                    all_procs.iter().map(|p| p.pid).collect();
+                                seen_pids.retain(|pid| active_pids.contains(pid));
+
+                                for proc in &all_procs {
+                                    process_command_verdict(
+                                        proc.pid,
+                                        &proc.name,
+                                        &proc.cmd,
+                                        &mode,
+                                        &mut seen_pids,
+                                        &ctx,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                })
+            };
 
             *self.task_handle.lock().await = Some(handle);
         }
