@@ -679,3 +679,82 @@ impl Guard for FsGuard {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// OpensnoopParser — parse opensnoop output to detect file reads (BUG 7)
+// ---------------------------------------------------------------------------
+
+/// A parsed event from `opensnoop` output (DTrace macOS).
+///
+/// `opensnoop` reports file open() syscalls, which the `notify` crate
+/// (FSEvents) does not capture. This fills the gap for read detection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpensnoopEvent {
+    /// Process ID that performed the open().
+    pub pid: u32,
+    /// Process name (from opensnoop COMM column).
+    pub process_name: String,
+    /// File descriptor returned by open().
+    pub fd: i32,
+    /// Full path of the opened file.
+    pub path: String,
+}
+
+/// Parser for `opensnoop` output lines.
+///
+/// Typical opensnoop output format:
+/// ```text
+///   PID    COMM      FD PATH
+/// 12345    node       3 /Users/test/.ssh/config
+/// ```
+pub struct OpensnoopParser;
+
+impl OpensnoopParser {
+    /// Parse a single line of opensnoop output.
+    ///
+    /// Returns `None` for header lines, empty lines, or unparseable input.
+    pub fn parse_line(line: &str) -> Option<OpensnoopEvent> {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        // Skip header line
+        if trimmed.starts_with("PID") {
+            return None;
+        }
+
+        // Format: PID    COMM      FD PATH
+        // Fields are whitespace-separated, but PATH may contain spaces.
+        // Strategy: extract first 3 tokens (PID, COMM, FD), then locate
+        // the path in the original line by finding the position after FD.
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+        if tokens.len() < 4 {
+            return None;
+        }
+
+        let pid: u32 = tokens[0].parse().ok()?;
+        let process_name = tokens[1].to_string();
+        let fd: i32 = tokens[2].parse().ok()?;
+
+        // Find the path: locate the FD token in the original trimmed string,
+        // then take everything after it. This preserves spaces in the path.
+        let fd_token = tokens[2];
+        // Find the start of the FD token after the COMM token
+        let comm_end = trimmed.find(tokens[1])? + tokens[1].len();
+        let fd_start = trimmed[comm_end..].find(fd_token)? + comm_end;
+        let after_fd = fd_start + fd_token.len();
+        let path = trimmed[after_fd..].trim_start().to_string();
+
+        if path.is_empty() {
+            return None;
+        }
+
+        Some(OpensnoopEvent {
+            pid,
+            process_name,
+            fd,
+            path,
+        })
+    }
+}

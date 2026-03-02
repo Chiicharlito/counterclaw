@@ -73,6 +73,7 @@ fn config_with_standard_blacklist() -> CmdGuardConfig {
             },
         ],
         monitoring_method: "log_only".to_string(),
+        poll_interval_ms: 500,
     }
 }
 
@@ -83,6 +84,7 @@ fn config_empty() -> CmdGuardConfig {
         blacklist: vec![],
         require_approval: vec![],
         monitoring_method: "log_only".to_string(),
+        poll_interval_ms: 500,
     }
 }
 
@@ -305,6 +307,7 @@ fn blacklist_checked_before_approval() {
             description: "pip needs approval".to_string(),
         }],
         monitoring_method: "log_only".to_string(),
+        poll_interval_ms: 500,
     };
     let matcher = CommandMatcher::new(&config);
     let verdict = matcher

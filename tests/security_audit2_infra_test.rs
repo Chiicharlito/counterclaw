@@ -230,6 +230,7 @@ async fn fs_guard_detects_stalled_watcher() {
         blocked_paths: vec!["/tmp/test_blocked".to_string()],
         read_only_paths: vec![],
         allowed_paths: vec![],
+        monitor_reads: false,
         on_violation: counterclaw::config::FsViolationConfig {
             action: "log_only".to_string(),
             kill_target: "process".to_string(),
@@ -257,6 +258,7 @@ fn fs_guard_watchdog_timeout_configurable() {
         blocked_paths: vec![],
         read_only_paths: vec![],
         allowed_paths: vec![],
+        monitor_reads: false,
         on_violation: counterclaw::config::FsViolationConfig {
             action: "log_only".to_string(),
             kill_target: "process".to_string(),

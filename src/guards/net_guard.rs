@@ -131,14 +131,52 @@ impl Default for DnsCache {
 // ConnectionInfo — informations sur une connexion réseau
 // ---------------------------------------------------------------------------
 
-/// Informations extraites d'une ligne lsof.
+/// Informations extraites d'une ligne lsof, enrichies optionnellement par sysinfo.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ConnectionInfo {
     pub pid: u32,
+    /// Nom de processus tel que rapporté par lsof (possiblement tronqué à ~15 chars).
     pub process_name: String,
     pub protocol: String,
     pub target_ip: String,
     pub target_port: u16,
+    /// Nom complet du processus via sysinfo (non tronqué). None si pas enrichi.
+    pub full_process_name: Option<String>,
+    /// Ligne de commande complète via sysinfo. None si pas enrichi.
+    pub full_cmd: Option<String>,
+}
+
+impl ConnectionInfo {
+    /// Vérifie si cette connexion correspond à un des patterns watch_processes.
+    ///
+    /// Matche contre : nom lsof tronqué OU nom sysinfo complet OU cmd sysinfo.
+    /// Si watch_processes est vide, matche tout (= pas de filtre).
+    pub fn matches_watch_processes(&self, patterns: &[String]) -> bool {
+        if patterns.is_empty() {
+            return true;
+        }
+
+        // Try matching with lsof truncated name
+        if crate::process::matches_process_patterns(&self.process_name, "", patterns) {
+            return true;
+        }
+
+        // Try matching with full sysinfo name
+        if let Some(ref full_name) = self.full_process_name {
+            if crate::process::matches_process_patterns(full_name, "", patterns) {
+                return true;
+            }
+        }
+
+        // Try matching with full cmd line (regex match against patterns)
+        if let Some(ref full_cmd) = self.full_cmd {
+            if crate::process::matches_process_patterns("", full_cmd, patterns) {
+                return true;
+            }
+        }
+
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +262,8 @@ impl ConnectionParser {
             protocol,
             target_ip,
             target_port,
+            full_process_name: None,
+            full_cmd: None,
         })
     }
 }
@@ -280,10 +320,12 @@ impl Guard for NetGuard {
             let watch_processes = self.config.watch_processes.clone();
             let events_total = Arc::clone(&self.events_total);
             let events_blocked = Arc::clone(&self.events_blocked);
+            let poll_interval = std::time::Duration::from_millis(self.config.poll_interval_ms);
 
             let handle = tokio::spawn(async move {
                 let mut seen_connections: HashSet<(u32, String, u16)> = HashSet::new();
                 let mut dns_cache = DnsCache::new();
+                let mut process_scanner = crate::process::ProcessScanner::new();
 
                 loop {
                     tokio::select! {
@@ -291,7 +333,7 @@ impl Guard for NetGuard {
                             tracing::info!("Net Guard polling shutting down");
                             break;
                         }
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {
+                        _ = tokio::time::sleep(poll_interval) => {
                             // Run lsof -i -n -P
                             let output = match tokio::process::Command::new("lsof")
                                 .args(["-i", "-n", "-P"])
@@ -306,7 +348,17 @@ impl Guard for NetGuard {
                             };
 
                             let stdout = String::from_utf8_lossy(&output.stdout);
-                            let connections = ConnectionParser::parse_lsof_output(&stdout);
+                            let mut connections = ConnectionParser::parse_lsof_output(&stdout);
+
+                            // Enrich connections with sysinfo data (full name + cmd)
+                            // One refresh per cycle, then O(1) lookups per PID
+                            process_scanner.refresh();
+                            for conn in &mut connections {
+                                if let Some(proc_info) = process_scanner.get_by_pid(conn.pid) {
+                                    conn.full_process_name = Some(proc_info.name);
+                                    conn.full_cmd = Some(proc_info.cmd);
+                                }
+                            }
 
                             // Get current mode
                             let mode = app_config
@@ -319,21 +371,11 @@ impl Guard for NetGuard {
                                 })
                                 .unwrap_or(crate::types::OperationMode::Monitor);
 
-                            // Filter to watched processes (if list is non-empty)
-                            let filtered: Vec<&ConnectionInfo> = if watch_processes.is_empty() {
-                                connections.iter().collect()
-                            } else {
-                                connections
-                                    .iter()
-                                    .filter(|c| {
-                                        crate::process::matches_process_patterns(
-                                            &c.process_name,
-                                            "",
-                                            &watch_processes,
-                                        )
-                                    })
-                                    .collect()
-                            };
+                            // Filter to watched processes using enriched info
+                            let filtered: Vec<&ConnectionInfo> = connections
+                                .iter()
+                                .filter(|c| c.matches_watch_processes(&watch_processes))
+                                .collect();
 
                             // Prune dead connections (clean seen set if > 10000)
                             if seen_connections.len() > 10_000 {

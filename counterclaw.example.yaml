@@ -64,6 +64,10 @@ fs_guard:
     - "~/.openclaw/sandboxes"
     - "/tmp/counterclaw-*"
 
+  # Détection de lectures via opensnoop (DTrace macOS)
+  # Nécessite sudo. Désactivé par défaut.
+  monitor_reads: false
+
   # Action quand un accès bloqué est détecté
   on_violation:
     action: kill_and_alert
@@ -195,6 +199,9 @@ net_guard:
   alert_on_unknown_dns: true
   enforcement_method: log_only
 
+  # Intervalle de polling lsof (ms). Défaut : 3000ms
+  poll_interval_ms: 3000
+
 # -----------------------------------------------------------------------------
 # Module 4 : Command Interceptor
 # -----------------------------------------------------------------------------
@@ -273,6 +280,9 @@ cmd_guard:
 
   monitoring_method: log_only
 
+  # Intervalle de polling processus (ms). Défaut : 500ms (4x plus rapide que 2s)
+  poll_interval_ms: 500
+
 # -----------------------------------------------------------------------------
 # Alerting
 # -----------------------------------------------------------------------------
@@ -298,6 +308,16 @@ alerting:
     threshold_count: 3
     threshold_window_seconds: 60
     action: suspend_openclaw
+
+    # Processus à tuer quand le kill switch se déclenche
+    watch_processes:
+      - "openclaw"
+      - "node.*openclaw"
+
+    # Patterns de chemins à exclure du comptage (bruit système)
+    exclude_path_patterns:
+      - "Library/Keychains"
+      - "login.keychain"
 
 # -----------------------------------------------------------------------------
 # Dashboard
