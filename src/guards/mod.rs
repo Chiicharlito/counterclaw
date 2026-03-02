@@ -13,5 +13,6 @@ pub mod fs_guard;
 #[cfg(target_os = "macos")]
 pub mod kqueue_monitor;
 pub mod net_guard;
+pub mod pf_guard;
 pub mod polling_monitor;
 pub mod process_monitor;

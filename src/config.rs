@@ -53,6 +53,8 @@ pub struct AppConfig {
     pub cmd_guard: CmdGuardConfig,
     pub alerting: AlertingConfig,
     pub dashboard: DashboardConfig,
+    #[serde(default)]
+    pub pf_guard: PfGuardConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,6 +247,51 @@ pub struct DashboardConfig {
     pub require_auth_for_reads: bool,
 }
 
+/// Default DNS refresh interval for pf_guard (300 seconds = 5 minutes).
+fn default_dns_refresh_seconds() -> u64 {
+    300
+}
+
+/// Default pf anchor name.
+fn default_anchor_name() -> String {
+    "com.counterclaw".to_string()
+}
+
+/// Configuration du PF Firewall Guard.
+///
+/// Bloque le trafic réseau sortant de l'agent IA au niveau kernel via pf (packet filter).
+/// Filtre par UID (utilisateur macOS dédié). Nécessite root pour l'enforcement.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PfGuardConfig {
+    /// Active le PF guard. Opt-in, nécessite root pour l'enforcement.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Nom d'utilisateur macOS de l'agent IA (ex: "_openclaw").
+    #[serde(default)]
+    pub agent_username: String,
+    /// Domaines/IPs autorisés en sortie (localhost implicite).
+    #[serde(default)]
+    pub allowed_destinations: Vec<String>,
+    /// Intervalle de ré-résolution DNS en secondes. Minimum 30s.
+    #[serde(default = "default_dns_refresh_seconds")]
+    pub dns_refresh_seconds: u64,
+    /// Nom de l'ancre pf (namespace isolé).
+    #[serde(default = "default_anchor_name")]
+    pub anchor_name: String,
+}
+
+impl Default for PfGuardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            agent_username: String::new(),
+            allowed_destinations: Vec::new(),
+            dns_refresh_seconds: default_dns_refresh_seconds(),
+            anchor_name: default_anchor_name(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ReDoS protection — Step 2.5
 // ---------------------------------------------------------------------------
@@ -397,6 +444,31 @@ impl AppConfig {
         // Dashboard port
         if self.dashboard.enabled && self.dashboard.port == 0 {
             errors.push("dashboard.port cannot be 0".to_string());
+        }
+
+        // PF Guard validation
+        if self.pf_guard.enabled {
+            if self.pf_guard.agent_username.is_empty() {
+                errors.push(
+                    "pf_guard.agent_username cannot be empty when pf_guard is enabled".to_string(),
+                );
+            } else if !self
+                .pf_guard
+                .agent_username
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                errors.push(format!(
+                    "pf_guard.agent_username '{}' contains invalid characters (only [a-zA-Z0-9_-] allowed)",
+                    self.pf_guard.agent_username
+                ));
+            }
+            if self.pf_guard.dns_refresh_seconds < 30 {
+                errors.push(format!(
+                    "pf_guard.dns_refresh_seconds {} is too low (minimum 30)",
+                    self.pf_guard.dns_refresh_seconds
+                ));
+            }
         }
 
         // Au moins un backend d'alerting activé

@@ -44,6 +44,7 @@ pub enum GuardModule {
     CdpProxy,
     NetGuard,
     CmdGuard,
+    PfGuard,
     /// Pour les événements système (démarrage, arrêt, kill switch).
     System,
 }
@@ -55,6 +56,7 @@ impl fmt::Display for GuardModule {
             GuardModule::CdpProxy => write!(f, "cdp_proxy"),
             GuardModule::NetGuard => write!(f, "net_guard"),
             GuardModule::CmdGuard => write!(f, "cmd_guard"),
+            GuardModule::PfGuard => write!(f, "pf_guard"),
             GuardModule::System => write!(f, "system"),
         }
     }
