@@ -72,6 +72,10 @@ pub struct FsGuardConfig {
     pub read_only_paths: Vec<String>,
     pub allowed_paths: Vec<String>,
     pub on_violation: FsViolationConfig,
+    /// Enable file read detection via opensnoop (macOS DTrace).
+    /// Default: false. Requires root or dtrace permissions.
+    #[serde(default)]
+    pub monitor_reads: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +124,11 @@ pub struct ContentPatternConfig {
     pub action: String,
 }
 
+/// Default polling interval for net_guard (3000ms).
+fn default_net_poll_interval_ms() -> u64 {
+    3000
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetGuardConfig {
     pub enabled: bool,
@@ -129,6 +138,14 @@ pub struct NetGuardConfig {
     pub block_unknown_post: bool,
     pub alert_on_unknown_dns: bool,
     pub enforcement_method: String,
+    /// Polling interval in milliseconds for lsof. Default: 3000ms.
+    #[serde(default = "default_net_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+}
+
+/// Default polling interval for cmd_guard (500ms).
+fn default_cmd_poll_interval_ms() -> u64 {
+    500
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +154,9 @@ pub struct CmdGuardConfig {
     pub blacklist: Vec<CommandPatternConfig>,
     pub require_approval: Vec<ApprovalPatternConfig>,
     pub monitoring_method: String,
+    /// Polling interval in milliseconds for process scanning. Default: 500ms.
+    #[serde(default = "default_cmd_poll_interval_ms")]
+    pub poll_interval_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +208,15 @@ pub struct KillSwitchConfig {
     pub threshold_count: u32,
     pub threshold_window_seconds: u64,
     pub action: String,
+    /// Process patterns to kill when kill switch triggers with action "kill" or "suspend_openclaw".
+    /// If empty, kill switch only logs (no process killing).
+    #[serde(default)]
+    pub watch_processes: Vec<String>,
+    /// Path patterns to exclude from kill switch event counting.
+    /// Events whose description contains any of these substrings are ignored.
+    /// Useful for filtering system noise (e.g., macOS Keychain events).
+    #[serde(default)]
+    pub exclude_path_patterns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

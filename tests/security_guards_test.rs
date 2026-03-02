@@ -111,6 +111,7 @@ fn empty_cmd_config() -> CmdGuardConfig {
         blacklist: vec![],
         require_approval: vec![],
         monitoring_method: "log_only".to_string(),
+        poll_interval_ms: 500,
     }
 }
 

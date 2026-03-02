@@ -628,7 +628,125 @@ impl CdpDecision {
 // process_cdp_message — fonction libre d'orchestration
 // ---------------------------------------------------------------------------
 
-/// Orchestre DomainMatcher + CommandFilter + ContentInspector + SessionState
+// ---------------------------------------------------------------------------
+// Chrome Event Inspection — détection de navigations dans les events Chrome
+// ---------------------------------------------------------------------------
+
+/// Décision pour un event Chrome (direction chrome→client).
+///
+/// Contrairement à CdpDecision, on ne bloque pas les events Chrome
+/// (on ne peut pas empêcher Chrome d'avoir déjà navigué). On alerte.
+#[derive(Debug)]
+pub enum ChromeEventDecision {
+    /// L'event est inoffensif, forwarder.
+    Forward,
+    /// L'event indique une navigation vers un domaine suspect.
+    /// On forward ET on émet une alerte.
+    Alert { reason: String, severity: Severity },
+}
+
+/// Inspecte un event Chrome (message sans `id`) pour détecter les navigations
+/// vers des domaines bloqués.
+///
+/// Events inspectés :
+/// - `Page.frameNavigated` → `params.frame.url`
+/// - `Page.navigatedWithinDocument` → `params.url`
+/// - `Network.requestWillBeSent` → `params.redirectResponse` (redirect chain)
+///
+/// Met à jour `session.current_url` pour que les commandes suivantes soient
+/// filtrées correctement sur le domaine actuel.
+pub fn process_chrome_event(
+    msg: &serde_json::Value,
+    domain_matcher: &DomainMatcher,
+    session: &mut CdpSessionState,
+    mode: &crate::types::OperationMode,
+) -> ChromeEventDecision {
+    let method = match msg.get("method").and_then(|v| v.as_str()) {
+        Some(m) => m,
+        None => return ChromeEventDecision::Forward,
+    };
+
+    // Extract URL from the event based on method type
+    let url = match method {
+        "Page.frameNavigated" => {
+            // params.frame.url
+            msg.get("params")
+                .and_then(|p| p.get("frame"))
+                .and_then(|f| f.get("url"))
+                .and_then(|u| u.as_str())
+        }
+        "Page.navigatedWithinDocument" => {
+            // params.url
+            msg.get("params")
+                .and_then(|p| p.get("url"))
+                .and_then(|u| u.as_str())
+        }
+        "Network.requestWillBeSent" => {
+            // params.redirectResponse exists → this is a redirect
+            // Check the request URL (the redirect target)
+            if msg
+                .get("params")
+                .and_then(|p| p.get("redirectResponse"))
+                .is_some()
+            {
+                msg.get("params")
+                    .and_then(|p| p.get("request"))
+                    .and_then(|r| r.get("url"))
+                    .and_then(|u| u.as_str())
+            } else {
+                None // Not a redirect, just a normal request
+            }
+        }
+        _ => None,
+    };
+
+    let url = match url {
+        Some(u) => u,
+        None => return ChromeEventDecision::Forward,
+    };
+
+    // Extract and check domain
+    let domain = match extract_domain_from_url(url) {
+        Some(d) => d,
+        None => return ChromeEventDecision::Forward,
+    };
+
+    let verdict = domain_matcher.check(&domain, mode);
+
+    // Always update session URL so restricted commands are filtered on current domain
+    session.update_url(url);
+
+    match verdict {
+        DomainVerdict::Blocked => {
+            let severity = match mode {
+                crate::types::OperationMode::Enforce | crate::types::OperationMode::Paranoid => {
+                    Severity::Critical
+                }
+                crate::types::OperationMode::Monitor => Severity::Warning,
+            };
+            ChromeEventDecision::Alert {
+                reason: format!(
+                    "Chrome navigated to blocked domain: {} (via {})",
+                    domain, method
+                ),
+                severity,
+            }
+        }
+        DomainVerdict::RequireApproval => ChromeEventDecision::Alert {
+            reason: format!(
+                "Chrome navigated to approval-required domain: {} (via {})",
+                domain, method
+            ),
+            severity: Severity::Warning,
+        },
+        DomainVerdict::Allowed => ChromeEventDecision::Forward,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// process_cdp_message — décision principale pour les messages CDP agent→Chrome
+// ---------------------------------------------------------------------------
+
 /// pour prendre une décision sur un message CDP.
 ///
 /// C'est une fonction libre (pas une méthode) : respecte SRP.
@@ -687,10 +805,19 @@ pub fn process_cdp_message(
         }
     };
 
-    // Les event messages (pas d'id) sont toujours forwardés
+    // Les event messages (pas d'id) : inspecter pour détecter les navigations Chrome
     let msg_id = match msg.id {
         Some(id) => id,
-        None => return CdpDecision::Forward,
+        None => {
+            // Inspect Chrome events for navigation to blocked domains
+            let chrome_decision = process_chrome_event(&msg.raw, domain_matcher, session, mode);
+            return match chrome_decision {
+                ChromeEventDecision::Forward => CdpDecision::Forward,
+                ChromeEventDecision::Alert { reason, severity } => CdpDecision::ForwardAndLog {
+                    reason: format!("{} [severity: {:?}]", reason, severity),
+                },
+            };
+        }
     };
 
     let method = match &msg.method {
@@ -730,11 +857,28 @@ pub fn process_cdp_message(
                         };
                     }
                     DomainVerdict::RequireApproval => {
-                        // MVP : on log et forward (pas d'interactive approval)
+                        // Mode-dependent: Monitor = forward + log, Enforce/Paranoid = block
                         session.update_url(&url);
-                        return CdpDecision::ForwardAndLog {
-                            reason: format!("Navigation to approval-required domain: {}", domain),
-                        };
+                        match mode {
+                            crate::types::OperationMode::Monitor => {
+                                return CdpDecision::ForwardAndLog {
+                                    reason: format!(
+                                        "Navigation to approval-required domain: {}",
+                                        domain
+                                    ),
+                                };
+                            }
+                            _ => {
+                                return CdpDecision::Block {
+                                    id: msg_id,
+                                    reason: format!(
+                                        "Navigation to approval-required domain blocked (no interactive approval): {}",
+                                        domain
+                                    ),
+                                    severity: Severity::Warning,
+                                };
+                            }
+                        }
                     }
                     DomainVerdict::Allowed => {
                         session.update_url(&url);
@@ -1169,8 +1313,12 @@ async fn ws_relay(
         }
     };
 
-    // Chrome → Client direction (passthrough)
+    // Chrome → Client direction (with Chrome event inspection)
     let client_tx_clone = Arc::clone(&client_tx);
+    let alert_tx_chrome = state.alert_tx.clone();
+    let app_config_chrome = state.app_config.clone();
+    let session_chrome = state.session.clone();
+    let domain_matcher_chrome = state.domain_matcher.clone();
     let chrome_to_client = async move {
         while let Some(msg_result) = chrome_rx.next().await {
             let msg = match msg_result {
@@ -1180,6 +1328,46 @@ async fn ws_relay(
 
             match msg {
                 TungMsg::Text(text) => {
+                    // Inspect Chrome events for navigation to blocked domains
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
+                        // Only inspect events (no "id" field)
+                        if parsed.get("id").is_none() && parsed.get("method").is_some() {
+                            let mode = app_config_chrome
+                                .read()
+                                .ok()
+                                .map(|cfg| match cfg.general.mode.as_str() {
+                                    "enforce" => crate::types::OperationMode::Enforce,
+                                    "paranoid" => crate::types::OperationMode::Paranoid,
+                                    _ => crate::types::OperationMode::Monitor,
+                                })
+                                .unwrap_or(crate::types::OperationMode::Monitor);
+
+                            let decision = {
+                                let mut session_guard = match session_chrome.lock() {
+                                    Ok(g) => g,
+                                    Err(poisoned) => poisoned.into_inner(),
+                                };
+                                process_chrome_event(
+                                    &parsed,
+                                    &domain_matcher_chrome,
+                                    &mut session_guard,
+                                    &mode,
+                                )
+                            };
+
+                            if let ChromeEventDecision::Alert { reason, severity } = decision {
+                                let event = SecurityEvent::new(
+                                    GuardModule::CdpProxy,
+                                    severity,
+                                    ActionTaken::Alerted,
+                                    reason,
+                                );
+                                let _ = alert_tx_chrome.try_send(event);
+                            }
+                        }
+                    }
+
+                    // Always forward Chrome events to client
                     if client_tx_clone
                         .lock()
                         .await

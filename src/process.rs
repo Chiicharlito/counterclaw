@@ -147,6 +147,25 @@ impl ProcessScanner {
             .collect()
     }
 
+    /// Recherche un processus par PID et retourne ses informations complètes.
+    ///
+    /// Utilise le cache sysinfo déjà rafraîchi (appeler `refresh()` d'abord).
+    /// Retourne None si le PID n'existe pas.
+    pub fn get_by_pid(&self, pid: u32) -> Option<ProcessInfo> {
+        let sysinfo_pid = sysinfo::Pid::from_u32(pid);
+        self.system.process(sysinfo_pid).map(|proc| ProcessInfo {
+            pid,
+            name: proc.name().to_string_lossy().to_string(),
+            cmd: proc
+                .cmd()
+                .iter()
+                .map(|s| s.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" "),
+            parent_pid: proc.parent().map(|p| p.as_u32()),
+        })
+    }
+
     /// Trouve les processus dont le nom ou la commande matche les patterns.
     pub fn find_matching(&self, patterns: &[String]) -> Vec<ProcessInfo> {
         self.scan_all()

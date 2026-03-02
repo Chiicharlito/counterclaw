@@ -261,6 +261,7 @@ impl Guard for CmdGuard {
             let app_config = Arc::clone(&self.app_config);
             let events_total = Arc::clone(&self.events_total);
             let events_blocked = Arc::clone(&self.events_blocked);
+            let poll_interval = std::time::Duration::from_millis(self.config.poll_interval_ms);
 
             let handle = tokio::spawn(async move {
                 let mut scanner = crate::process::ProcessScanner::new();
@@ -272,7 +273,7 @@ impl Guard for CmdGuard {
                             tracing::info!("Cmd Guard polling shutting down");
                             break;
                         }
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                        _ = tokio::time::sleep(poll_interval) => {
                             scanner.refresh();
                             let all_procs = scanner.scan_all();
 
