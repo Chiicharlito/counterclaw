@@ -284,6 +284,27 @@ cmd_guard:
   poll_interval_ms: 500
 
 # -----------------------------------------------------------------------------
+# Module 5 : PF Firewall Guard (kernel-level network blocking)
+# -----------------------------------------------------------------------------
+pf_guard:
+  # Nécessite root (LaunchDaemon). Désactivé par défaut.
+  enabled: false
+
+  # Utilisateur macOS dédié sous lequel l'agent IA tourne
+  agent_username: "_openclaw"
+
+  # Destinations réseau autorisées (les autres sont bloquées)
+  allowed_destinations:
+    - "api.openai.com"
+    - "api.anthropic.com"
+
+  # Intervalle de ré-résolution DNS (secondes, minimum 30)
+  dns_refresh_seconds: 300
+
+  # Nom de l'ancre pf (isolé du pf.conf système)
+  anchor_name: "com.counterclaw"
+
+# -----------------------------------------------------------------------------
 # Alerting
 # -----------------------------------------------------------------------------
 alerting:

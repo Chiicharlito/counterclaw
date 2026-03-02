@@ -9,6 +9,7 @@ use crate::guards::cdp_proxy::CdpProxy;
 use crate::guards::cmd_guard::CmdGuard;
 use crate::guards::fs_guard::FsGuard;
 use crate::guards::net_guard::NetGuard;
+use crate::guards::pf_guard::PfGuard;
 use crate::types::{
     ActionTaken, EventBuffer, Guard, GuardModule, GuardStatus, OperationMode, SecurityEvent,
     Severity,
@@ -148,6 +149,10 @@ impl DaemonState {
             )),
             Arc::new(CmdGuard::new(
                 &config_arc.read().expect("config read").cmd_guard,
+                Arc::clone(&config_arc),
+            )),
+            Arc::new(PfGuard::new(
+                &config_arc.read().expect("config read").pf_guard,
                 Arc::clone(&config_arc),
             )),
         ];

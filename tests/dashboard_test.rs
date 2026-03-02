@@ -123,13 +123,14 @@ async fn status_lists_guards() {
 
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     let guards = json["guards"].as_array().expect("guards should be array");
-    assert_eq!(guards.len(), 4, "Should list all 4 guards");
+    assert_eq!(guards.len(), 5, "Should list all 5 guards");
 
     let names: Vec<&str> = guards.iter().map(|g| g["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"fs_guard"));
     assert!(names.contains(&"cdp_proxy"));
     assert!(names.contains(&"net_guard"));
     assert!(names.contains(&"cmd_guard"));
+    assert!(names.contains(&"pf_guard"));
 }
 
 // ---------------------------------------------------------------------------
