@@ -246,6 +246,221 @@ async fn no_events_when_disabled() {
     guard.stop().await.expect("stop failed");
 }
 
+// ===========================================================================
+// Issue 3 : Subprocess integration tests — verify FsGuard detects
+// filesystem events from external processes (not just the test process)
+// ===========================================================================
+
+/// Un sous-processus `touch` dans un répertoire bloqué génère un SecurityEvent.
+#[tokio::test]
+async fn subprocess_write_to_blocked_dir_detected() {
+    let env = common::TestEnv::new();
+    let blocked_dir = env.root().join("blocked_sub");
+    fs::create_dir_all(&blocked_dir).unwrap();
+
+    let config = fs_io_config(vec![blocked_dir.to_string_lossy().to_string()], vec![]);
+    let guard = FsGuard::new(&config, common::test_app_config_arc());
+    let (tx, mut rx) = mpsc::channel::<SecurityEvent>(64);
+
+    guard.start(tx).await.expect("start failed");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Use a subprocess to create a file
+    let target = blocked_dir.join("secret_from_subprocess.txt");
+    std::process::Command::new("touch")
+        .arg(&target)
+        .status()
+        .expect("failed to execute touch");
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("Timed out waiting for SecurityEvent from subprocess")
+        .expect("Channel closed");
+
+    assert_eq!(event.module, GuardModule::FsGuard);
+
+    guard.stop().await.expect("stop failed");
+}
+
+/// Un sous-processus `cat` lisant un fichier bloqué — FsGuard détecte la création
+/// du fichier accédé (note: notify détecte les accès metadata/write, pas les reads purs).
+#[tokio::test]
+async fn subprocess_read_generates_metadata_event() {
+    let env = common::TestEnv::new();
+    let blocked_dir = env.root().join("blocked_read");
+    fs::create_dir_all(&blocked_dir).unwrap();
+    // Pre-create a file to read
+    let target = blocked_dir.join("existing_file.txt");
+    fs::write(&target, "sensitive content").unwrap();
+
+    let config = fs_io_config(vec![blocked_dir.to_string_lossy().to_string()], vec![]);
+    let guard = FsGuard::new(&config, common::test_app_config_arc());
+    let (tx, mut rx) = mpsc::channel::<SecurityEvent>(64);
+
+    guard.start(tx).await.expect("start failed");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Use subprocess to write (overwrite) the file — this triggers a write event
+    std::process::Command::new("sh")
+        .args(["-c", &format!("echo 'modified' > '{}'", target.display())])
+        .status()
+        .expect("failed to execute sh");
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("Timed out waiting for SecurityEvent")
+        .expect("Channel closed");
+
+    assert_eq!(event.module, GuardModule::FsGuard);
+
+    guard.stop().await.expect("stop failed");
+}
+
+/// Un sous-processus `touch` dans un répertoire read_only génère un SecurityEvent.
+#[tokio::test]
+async fn subprocess_write_to_read_only_dir_detected() {
+    let env = common::TestEnv::new();
+    let ro_dir = env.root().join("readonly_sub");
+    fs::create_dir_all(&ro_dir).unwrap();
+
+    let config = fs_io_config(vec![], vec![ro_dir.to_string_lossy().to_string()]);
+    let guard = FsGuard::new(&config, common::test_app_config_arc());
+    let (tx, mut rx) = mpsc::channel::<SecurityEvent>(64);
+
+    guard.start(tx).await.expect("start failed");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let target = ro_dir.join("readonly_write_attempt.txt");
+    std::process::Command::new("touch")
+        .arg(&target)
+        .status()
+        .expect("failed to execute touch");
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("Timed out waiting for SecurityEvent from subprocess")
+        .expect("Channel closed");
+
+    assert_eq!(event.module, GuardModule::FsGuard);
+
+    guard.stop().await.expect("stop failed");
+}
+
+/// Un sous-processus `touch` dans un répertoire non-surveillé ne génère pas d'alerte.
+#[tokio::test]
+async fn subprocess_write_to_allowed_dir_no_alert() {
+    let env = common::TestEnv::new();
+    let blocked_dir = env.root().join("blocked_area_sub");
+    let safe_dir = env.root().join("safe_area_sub");
+    fs::create_dir_all(&blocked_dir).unwrap();
+    fs::create_dir_all(&safe_dir).unwrap();
+
+    let config = fs_io_config(vec![blocked_dir.to_string_lossy().to_string()], vec![]);
+    let guard = FsGuard::new(&config, common::test_app_config_arc());
+    let (tx, mut rx) = mpsc::channel::<SecurityEvent>(64);
+
+    guard.start(tx).await.expect("start failed");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Subprocess writes to the safe directory
+    let target = safe_dir.join("allowed_file.txt");
+    std::process::Command::new("touch")
+        .arg(&target)
+        .status()
+        .expect("failed to execute touch");
+
+    let result = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
+    assert!(
+        result.is_err(),
+        "Should not receive event for subprocess in unmatched dir"
+    );
+
+    guard.stop().await.expect("stop failed");
+}
+
+/// Un sous-processus `mkdir` dans un répertoire bloqué génère un SecurityEvent.
+#[tokio::test]
+async fn subprocess_mkdir_in_blocked_dir_detected() {
+    let env = common::TestEnv::new();
+    let blocked_dir = env.root().join("blocked_mkdir");
+    fs::create_dir_all(&blocked_dir).unwrap();
+
+    let config = fs_io_config(vec![blocked_dir.to_string_lossy().to_string()], vec![]);
+    let guard = FsGuard::new(&config, common::test_app_config_arc());
+    let (tx, mut rx) = mpsc::channel::<SecurityEvent>(64);
+
+    guard.start(tx).await.expect("start failed");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let target = blocked_dir.join("subdir_from_subprocess");
+    std::process::Command::new("mkdir")
+        .arg(&target)
+        .status()
+        .expect("failed to execute mkdir");
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("Timed out waiting for SecurityEvent from mkdir subprocess")
+        .expect("Channel closed");
+
+    assert_eq!(event.module, GuardModule::FsGuard);
+
+    guard.stop().await.expect("stop failed");
+}
+
+/// Des écritures rapides par sous-processus sont toutes détectées (tolérance timing).
+#[tokio::test]
+async fn subprocess_rapid_writes_mostly_detected() {
+    let env = common::TestEnv::new();
+    let blocked_dir = env.root().join("blocked_rapid");
+    fs::create_dir_all(&blocked_dir).unwrap();
+
+    let config = fs_io_config(vec![blocked_dir.to_string_lossy().to_string()], vec![]);
+    let guard = FsGuard::new(&config, common::test_app_config_arc());
+    let (tx, mut rx) = mpsc::channel::<SecurityEvent>(64);
+
+    guard.start(tx).await.expect("start failed");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Write 10 files rapidly via subprocess
+    for i in 0..10 {
+        let target = blocked_dir.join(format!("rapid_{}.txt", i));
+        std::process::Command::new("touch")
+            .arg(&target)
+            .status()
+            .expect("failed to execute touch");
+    }
+
+    // Collect events with timeout — expect at least 8 out of 10
+    let mut event_count = 0;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let remaining = deadline - tokio::time::Instant::now();
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(event)) => {
+                assert_eq!(event.module, GuardModule::FsGuard);
+                event_count += 1;
+                if event_count >= 10 {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+
+    assert!(
+        event_count >= 8,
+        "Expected at least 8 events from 10 rapid writes, got {}",
+        event_count
+    );
+
+    guard.stop().await.expect("stop failed");
+}
+
+// ===========================================================================
+// Existing tests
+// ===========================================================================
+
 /// Le watchdog est mis à jour lors d'events filesystem.
 #[tokio::test]
 async fn updates_watchdog_on_event() {

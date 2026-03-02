@@ -115,3 +115,45 @@ fn scanner_returns_empty_for_nonexistent() {
         "Should find no process matching a nonexistent pattern"
     );
 }
+
+// ===========================================================================
+// has_watched_processes + find_watched_pids (Issue 4 — AdaptivePoller support)
+// ===========================================================================
+
+/// has_watched_processes retourne true quand un processus matche.
+#[test]
+fn has_watched_processes_finds_current_process() {
+    let mut scanner = ProcessScanner::new();
+    // Use a regex that matches common processes (launchd/kernel on macOS, init on Linux)
+    // These are always running
+    let found = scanner.has_watched_processes(&["launchd|init|systemd".to_string()]);
+    assert!(found, "Should find at least one system process");
+}
+
+/// has_watched_processes retourne false pour un pattern inexistant.
+#[test]
+fn has_watched_processes_returns_false_for_nonexistent() {
+    let mut scanner = ProcessScanner::new();
+    let found = scanner.has_watched_processes(&["zzz_nonexistent_xyz_42".to_string()]);
+    assert!(!found, "Should not find nonexistent process");
+}
+
+/// find_watched_pids retourne les PIDs des processus surveillés.
+#[test]
+fn find_watched_pids_returns_matching_pids() {
+    let mut scanner = ProcessScanner::new();
+    // Use a regex that matches common processes
+    let pids = scanner.find_watched_pids(&["launchd|init|systemd".to_string()]);
+    assert!(!pids.is_empty(), "Should find at least one matching PID");
+}
+
+/// find_watched_pids retourne un vec vide pour un pattern inexistant.
+#[test]
+fn find_watched_pids_empty_for_nonexistent() {
+    let mut scanner = ProcessScanner::new();
+    let pids = scanner.find_watched_pids(&["zzz_nonexistent_xyz_42".to_string()]);
+    assert!(
+        pids.is_empty(),
+        "Should find no PIDs for nonexistent pattern"
+    );
+}

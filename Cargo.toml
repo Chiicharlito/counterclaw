@@ -70,6 +70,10 @@ url = "2"
 dirs = "6"
 idna = "1"
 
+# kqueue process monitoring (macOS)
+[target.'cfg(target_os = "macos")'.dependencies]
+nix = { version = "0.29", features = ["event", "signal"] }
+
 [dev-dependencies]
 # Temp directories for test isolation
 tempfile = "3"
