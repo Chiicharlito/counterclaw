@@ -120,6 +120,8 @@ pub enum TestTarget {
     Domain { domain: String },
     /// Test a command against CMD rules
     Command { command: String },
+    /// Test a destination against PF egress rules
+    Egress { destination: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +267,29 @@ fn cmd_test(config_path: Option<String>, target: TestTarget) {
                 None => {
                     println!("ALLOWED — command matches no rules");
                 }
+            }
+        }
+        TestTarget::Egress { destination } => {
+            use counterclaw::guards::pf_guard::PfRuleGenerator;
+
+            // Localhost is always allowed
+            if PfRuleGenerator::is_localhost(&destination) {
+                println!("ALLOWED — localhost is always permitted");
+                return;
+            }
+
+            // Check if the destination is in allowed_destinations
+            let is_allowed = app_config
+                .pf_guard
+                .allowed_destinations
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(&destination));
+
+            if is_allowed {
+                println!("ALLOWED — destination is in pf_guard.allowed_destinations");
+            } else {
+                println!("BLOCKED — destination not in pf_guard.allowed_destinations");
+                std::process::exit(1);
             }
         }
     }

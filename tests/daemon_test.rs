@@ -93,7 +93,7 @@ fn daemon_state_reports_guard_statuses() {
 
     let statuses = state.guard_statuses();
     // With all guards disabled, we should still get entries for each guard
-    assert_eq!(statuses.len(), 4, "Should have 4 guards");
+    assert_eq!(statuses.len(), 5, "Should have 5 guards");
 }
 
 #[test]
@@ -109,6 +109,7 @@ fn daemon_state_guard_names_correct() {
     assert!(names.contains(&"cdp_proxy"), "Should have cdp_proxy");
     assert!(names.contains(&"net_guard"), "Should have net_guard");
     assert!(names.contains(&"cmd_guard"), "Should have cmd_guard");
+    assert!(names.contains(&"pf_guard"), "Should have pf_guard");
 }
 
 #[tokio::test]

@@ -960,6 +960,9 @@ async fn rules_list_all(
             "blacklist": config.cmd_guard.blacklist,
             "require_approval": config.cmd_guard.require_approval,
         },
+        "pf": {
+            "allowed_destinations": config.pf_guard.allowed_destinations,
+        },
     })))
 }
 
@@ -989,6 +992,9 @@ async fn rules_get_guard(
         "commands" => Ok(Json(serde_json::json!({
             "blacklist": config.cmd_guard.blacklist,
             "require_approval": config.cmd_guard.require_approval,
+        }))),
+        "pf" => Ok(Json(serde_json::json!({
+            "allowed_destinations": config.pf_guard.allowed_destinations,
         }))),
         _ => Err(StatusCode::NOT_FOUND),
     }
@@ -1241,6 +1247,25 @@ async fn rules_add(
                 }
             }
         }
+        "pf" => {
+            let value = body
+                .value
+                .ok_or((StatusCode::BAD_REQUEST, "Missing 'value' field".to_string()))?;
+            validate_rule_value(&value)?;
+            validate_domain_format(&value)?;
+            let list: &mut Vec<String> = match body.category.as_str() {
+                "allowed_destinations" => &mut config.pf_guard.allowed_destinations,
+                _ => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!("Invalid category '{}' for pf guard", body.category),
+                    ))
+                }
+            };
+            validate_category_limit(list.len())?;
+            check_duplicate_string(list, &value)?;
+            list.push(value);
+        }
         _ => return Err((StatusCode::NOT_FOUND, format!("Unknown guard '{}'", guard))),
     }
 
@@ -1282,6 +1307,7 @@ async fn rules_delete(
         ("domains", "allowed") => &mut config.cdp_proxy.domains.allowed,
         ("domains", "require_approval") => &mut config.cdp_proxy.domains.require_approval,
         ("egress", "allowed") => &mut config.net_guard.allowed_egress,
+        ("pf", "allowed_destinations") => &mut config.pf_guard.allowed_destinations,
         _ => {
             return Err((
                 StatusCode::NOT_FOUND,
